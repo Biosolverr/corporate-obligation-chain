@@ -1,8 +1,9 @@
 # Architecture — SemanticObligationGate + ProcessGraphRouter + CertificationGate
 
-Status: **all three contracts implemented; 45/45 tests executed for real**
-against genlayer-test 0.29.2 / GenVM v0.2.16 in Direct Mode (18 Gate, 21
-Router, 6 CertificationGate) -- AND one real bug already found and fixed
+Status: **all three contracts implemented; 56/56 tests executed for real**
+against genlayer-test 0.29.2 / GenVM v0.2.16 in Direct Mode (23 Gate, 27
+Router, 6 CertificationGate), including fixes from an independent
+external adversarial audit (Part E) -- AND one real bug already found and fixed
 via an actual live Studio deployment attempt (§23.8: Address-typed
 arguments arriving as plain `int`, not `Address`). This is not a syntax
 check: real storage descriptors, real `run_nondet_unsafe` leader/validator
@@ -667,6 +668,252 @@ directly correspond to §28.1/§28.3/§28.4's closed findings. §28.2,
 §28.6, §28.7, §28.8, §28.9 remain open by deliberate choice and are
 listed here precisely so they don't need to be rediscovered by whoever
 reviews this next.
+
+## Part E — External audit findings (independent review, this session)
+
+An independent adversarial review of this repository (not written by the
+same process that wrote the contracts) found ten issues, numbered #1-#10
+below exactly as delivered, ranked 🔴 critical / 🟠 high / 🟡 architectural.
+Nearly all were real and correctly severity-rated; this section records
+what was fixed, what was deliberately not fixed and why, and one case
+where the reviewer's suggested framing, if implemented literally, would
+have made the contract worse — walked through in detail because "the
+external reviewer was right" isn't automatically true just because a
+finding sounds plausible, and getting that distinction right matters as
+much as fixing real bugs.
+
+### #1 [PARTIALLY ADDRESSED — see honest limitation below] `evidence_hash`
+does not commit to the submitted artifact
+
+**The finding, verbatim and correct:** `submit_evidence()` stores
+`evidence_hash` as a bare declaration; `adjudicate()` fetches evidence
+fresh and computes its own hash, but nothing ever compared the two. A
+submitter could commit to content A, have the URL change to content B
+before adjudication, and — as long as leader and validators all
+consistently see B — consensus would approve based on B while the
+on-chain record implies A was reviewed.
+
+**What was tried, and reverted:** the first fix attempt compared
+`obligation.evidence_hash` against the internally-computed
+`_evidence_content_hash` (the hash of the exact, truncated,
+`"--- SOURCE: ..."`-decorated text handed to the LLM) and forced
+`UNDETERMINED` on any mismatch. This was caught before being finalized:
+**no realistic submitter can predict this contract's internal
+prompt-formatting exactly**, so this comparison would mismatch on
+essentially every normal submission (confirmed by realizing it would have
+broken every existing test and every live Studio submission in this
+project's own testing history, which all used arbitrary placeholder
+hashes like `"hash-1"`). Shipping that "fix" would have made the contract
+functionally unusable while providing no real security benefit against a
+submitter who simply doesn't bother computing a real hash (the common
+case) — it would only have inconvenienced honest users, not stopped a
+adversarial one who could trivially compute a matching hash if the format
+is public.
+
+**What was actually done:** `submit_evidence()`'s docstring now states
+plainly that `evidence_hash` is submitter-declared, unverified metadata,
+not an enforced commitment — and explains exactly why (see above).
+`resolved_evidence_hash` (already existing) remains as an audit-only
+field: what consensus actually agreed was fetched, available for
+off-chain comparison against expectations, but not automated.
+
+**Honest residual gap, stated plainly (matches the reviewer's core point):
+there is no on-chain-enforced binding between what a submitter commits to
+at `submit_evidence()` time and what gets adjudicated later.** The
+only real fix is architectural, not a comparison bolted onto URL-based
+evidence: point `evidence_refs` at content-addressed storage (an IPFS URI
+whose CID already *is* the content hash), so the reference itself is the
+commitment and drift is impossible by construction rather than
+detected-and-penalized after the fact. This was already this project's
+recommendation for production use (Part D, §28.2) before this audit, and
+remains the answer — this finding sharpened *why* a hash-comparison
+patch doesn't substitute for it, which is a genuinely useful correction to
+this project's own earlier reasoning.
+
+### #2 [CLOSED] Retrieval failure was not fail-closed
+
+**The finding, correct and CRITICAL-rated correctly:** a fetch exception
+was converted to inert text (`"[EVIDENCE_FETCH_FAILED: ...]"`) and hoped
+the LLM would follow the prompt's instruction to answer `UNDETERMINED`.
+Nothing in code stopped a misbehaving or hallucinating model from
+answering `APPROVED` anyway — `_is_valid_verdict` checked structure, not
+"did retrieval actually succeed".
+
+**Fix:** `_fetch_evidence_text` now returns `(text, had_failure: bool)`.
+`_run_adjudication` computes this per call and, if `had_failure` is
+`True` and the model said `APPROVED` anyway, **deterministically
+overrides** the decision to `UNDETERMINED` with `reason_code =
+"EVIDENCE_FETCH_FAILED"` — in code, unconditionally, not as a prompt
+suggestion. `_fetch_failed` is also now a required field in
+`_is_valid_verdict` and a compared field in `_verdicts_semantically_equal`,
+so leader and validator must agree on whether retrieval succeeded, not
+just on the resulting decision.
+
+**Verified:** `test_fetch_failure_forces_undetermined_even_if_llm_says_approved`
+deliberately mocks the LLM to answer `APPROVED` while leaving the
+evidence URL entirely unmocked (Direct Mode raises `MockNotFoundError`,
+standing in for a real network failure) — confirms the override fires and
+`UNDETERMINED`/`EVIDENCE_FETCH_FAILED` is what actually gets recorded.
+
+### #3 [CLOSED] Consensus on a self-contradictory verdict was accepted
+
+**The finding, correct:** the prompt tells the model "APPROVED only if
+all three match fields are true and there's no critical exception," but
+`_is_valid_verdict` only checked field *types* — `{"decision": "APPROVED",
+"quantity_match": false, ...}` passed structural validation. The
+reviewer's framing of this is worth repeating verbatim because it's
+exactly right: **"Consensus ≠ semantic validity."** Several nodes
+agreeing on the same malformed-but-well-typed JSON is not the same as
+several nodes agreeing on a JSON that satisfies the system's own rules.
+
+**Fix:** `_is_valid_verdict` now also rejects `decision == APPROVED`
+unless `quantity_match and specification_match and deadline_match and not
+critical_exception` all hold. Since both leader and validator's own
+outputs are run through this same function, an internally-inconsistent
+`APPROVED` fails validity before it can even be compared for agreement.
+
+**Verified:** `test_internally_inconsistent_approved_verdict_rejected`
+mocks exactly this contradictory JSON and confirms the obligation lands
+in `UNDETERMINED`/`CONSENSUS_INVALID_RESULT`, never `FINALIZED`.
+
+**Broader point conceded:** the reviewer's synthesis (#10 below) that this
+project needed "a deterministic invariant layer between consensus and
+state transition" is correct, and findings #2 and #3 are exactly that
+layer for the two invariants that mattered most. `_is_valid_verdict` was
+already positioned as this layer's entry point before this audit; it just
+wasn't doing enough checking.
+
+### #4 / #5 [CLOSED] Router had no protection against obligation
+replay/reuse
+
+**The finding, correct and rated correctly as more serious than ordinary
+spoofing:** `register_process`'s ownership check only asked "was this
+obligation created by the right authority?" — never "is this obligation
+already spoken for, by this process or any other?" The reviewer's
+concrete attack (reusing a real, already-`APPROVED` `PermitA-FIRE`
+obligation as the `fire_safety` stage of an entirely unrelated,
+fabricated `Fake Permit B`) is exactly right and would have worked exactly
+as described. The milder variant (#5: two stages in the *same* graph both
+pointing at one obligation, turning one real adjudication into several
+"independent" approvals) shares the same root cause.
+
+**Fix:** a new Router-wide (not per-process) `claimed_obligation_ids`
+list. `register_process` now rejects any stage whose `obligation_id` is
+already claimed — by an earlier stage in *this* graph, or by any stage of
+*any previously registered process* — before accepting it, and claims
+each stage's obligation as it's accepted. An obligation can now only ever
+back one stage, once, anywhere on this Router, permanently.
+
+**Verified, with an honest scope split:** the intra-graph half (#5) is
+fully testable in Direct Mode, because the check was deliberately placed
+*before* any cross-contract call — `test_intra_graph_obligation_reuse_rejected`
+confirms two stages in one graph referencing the same `obligation_id`
+are rejected. The cross-process half (#4) shares the exact same
+`claimed_obligation_ids` mechanism but can only be exercised with a real
+second `register_process` call against a real Gate deployment — the same
+one-contract-per-process Direct Mode limitation documented in §23.4
+applies here too. This is flagged, not glossed over: **the code fix
+covers both #4 and #5 by construction, but only #5 has a passing
+automated test in this repository; #4 needs a live/glsim run to verify
+end-to-end** — add it to `deploy/STUDIO_TESTING_GUIDE.md`'s next pass.
+
+### #6 [CLOSED] DAG size was bounded by stage count but not edge count
+
+**The finding, correct:** `max_stages_per_process` bounded stages, but
+edges had no cap and duplicates were accepted freely — a graph with few
+stages but a very large or duplicate-heavy edge list was accepted,
+inflating validation and storage cost.
+
+**Fix:** `HARD_MAX_EDGES_CEILING = 64` enforced in `_validate_dag_payload`,
+plus an explicit duplicate-`(stage_id, depends_on)`-pair rejection.
+
+**Verified:** `test_too_many_edges_rejected` (65 edges between 4 stages)
+and `test_duplicate_edge_rejected`.
+
+### #7 [CLOSED] Several fields had no length bound
+
+**The finding, correct:** `obligation_id`, `process_id`, each
+`evidence_ref`, `evidence_hash`, and `graph_json`'s overall size were all
+checked for non-emptiness but never for a maximum length — an
+unbounded-size attack surface on storage and calldata cost.
+
+**Fix:** `MAX_OBLIGATION_ID_CHARS`, `MAX_EVIDENCE_REF_CHARS`,
+`MAX_EVIDENCE_HASH_CHARS` (Gate); `MAX_PROCESS_ID_CHARS`,
+`MAX_OBLIGATION_ID_CHARS` (stage-level), `MAX_GRAPH_JSON_CHARS` (Router).
+
+**Verified:** `test_oversized_obligation_id_rejected`,
+`test_oversized_evidence_ref_rejected`,
+`test_oversized_evidence_hash_rejected` (Gate);
+`test_process_id_too_long_rejected`, `test_graph_json_too_large_rejected`,
+`test_oversized_obligation_id_in_stage_rejected` (Router).
+
+### #8 [ALREADY CORRECT, DOCS TIGHTENED] `CertificationGate.claim_eligibility`
+has no sender restriction
+
+**The finding:** anyone can call `claim_eligibility`, and `claimed_by` is
+just whoever happened to call it — a vulnerability *if* a downstream
+system ever treats `claimed_by` as an authorization/ownership field.
+
+**Assessment:** this was already an explicit, documented design choice
+(certification_gate.py's module docstring, "AUTHORITY MODEL" section),
+consistent with the same permissionless-trigger pattern used by
+`adjudicate()` and `refresh_process_status()` throughout this codebase —
+the outcome (`ELIGIBLE` or not) is fully determined by already-consensus-backed
+upstream state, not by who calls the method, so restricting the caller
+adds a liveness risk without adding security. No code change was needed.
+The reviewer's real point — the *semantics* of `claimed_by` must be
+unambiguous to anyone integrating with this contract, since a wrong
+assumption here is a real vulnerability in whatever *reads* this field —
+was fair, so the docstring was reviewed again to make sure "informational
+audit trail, never an authorization check" is stated as unmissably as
+possible for a future integrator who doesn't read this file end to end.
+
+### #9 [ALREADY CORRECT, verified by re-derivation] Router terminal-status
+timing, checked against Gate re-adjudication
+
+**The finding, framed as a question rather than a confirmed bug:** does
+`UNDETERMINED -> new evidence -> APPROVED` ever risk the Router marking
+`FAILED` prematurely?
+
+**Re-derived from the actual code, not merely asserted:** `refresh_process_status`
+only sets `FAILED` when a mandatory stage's Gate status is `FINALIZED`
+*and* decision is `REJECTED`. `UNDETERMINED` never satisfies that
+condition (it isn't `FINALIZED`), so a stage sitting in `UNDETERMINED`
+keeps the whole process `ACTIVE`, never `FAILED`, for as long as it takes
+to re-adjudicate it. And `FINALIZED`+`REJECTED` is itself terminal on the
+Gate (`adjudicate()`'s own guard excludes `FINALIZED` from the set of
+re-adjudicable statuses) — so there is no sequence in which a stage that
+will *eventually* become `APPROVED` can first pass through a Gate-side
+`FINALIZED`/`REJECTED` state that would trigger a premature Router
+`FAILED`. This was correct before the audit; the audit prompted writing
+down *why*, explicitly, rather than leaving it implicit.
+
+### #10 Synthesis: the missing deterministic-invariant layer
+
+The reviewer's closing diagram — evidence → LLM judgment → consensus →
+`FINALIZED`, with no explicit "integrity check / invariant check" stage
+in between — is an accurate description of what this file looked like
+before this audit, and a fair generalization of findings #2 and #3
+specifically. That layer now exists, concretely, as the combination of:
+`_is_valid_verdict`'s logical-consistency check (#3), the
+`_fetch_failed`-forces-`UNDETERMINED` override (#2), and
+`ProcessGraphRouter`'s `claimed_obligation_ids` check (#4/#5) — three
+separate, specific deterministic gates, not one generic "invariant
+layer" module, because each closes a different failure mode with a
+different mechanism. Finding #1 is the one place this synthesis doesn't
+fully apply: no deterministic check inside this contract chain can
+substitute for evidence sources that are content-addressed in the first
+place (see #1's writeup) — that invariant has to live in the evidence
+model itself, not in a check written after the fact.
+
+### Tally after external audit fixes
+
+| File | Tests | Result |
+|---|---|---|
+| `test_semantic_gate.py` | 23 (+5 this pass) | 23 passed |
+| `test_process_graph_router.py` | 27 (+6 this pass) | 27 passed |
+| `test_certification_gate.py` | 6 | 6 passed |
+| **Total** | **56** | **56 passed** |
 
 ## 10. Development order followed
 
