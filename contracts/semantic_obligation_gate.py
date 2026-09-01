@@ -148,6 +148,9 @@ MAX_EVIDENCE_REFS = 5
 MAX_EVIDENCE_CHARS_PER_SOURCE = 4000
 MAX_REASON_CODE_CHARS = 64
 MAX_POLICY_CHARS = 4000
+MAX_OBLIGATION_ID_CHARS = 128
+MAX_EVIDENCE_REF_CHARS = 500
+MAX_EVIDENCE_HASH_CHARS = 128
 
 
 def _coerce_address(val) -> Address:
@@ -214,9 +217,16 @@ class Obligation:
 
 
 def _is_valid_verdict(data) -> bool:
-    """Structural validation of an adjudication result. Never trusts an LLM
-    to have followed the schema; this is what makes `run_nondet_unsafe`'s
-    validator meaningful instead of decorative."""
+    """Structural AND logical validation of an adjudication result. Never
+    trusts an LLM to have followed either the schema or its own stated
+    decision rule -- this is what makes `run_nondet_unsafe`'s validator
+    meaningful instead of decorative, and what turns "several executors
+    agreed on the same JSON" into "that JSON is internally consistent with
+    the system's own invariants", not just structurally well-typed.
+    Consensus on a malformed or self-contradictory verdict is not safety;
+    this function is the deterministic invariant layer that sits between
+    consensus and a state transition (see module docstring's Evidence
+    Integrity section)."""
     if not isinstance(data, dict):
         return False
     if data.get("decision") not in _VALID_DECISIONS:
@@ -230,6 +240,23 @@ def _is_valid_verdict(data) -> bool:
     evidence_content_hash = data.get("_evidence_content_hash")
     if not isinstance(evidence_content_hash, str) or not evidence_content_hash:
         return False
+    if not isinstance(data.get("_fetch_failed"), bool):
+        return False
+    # Logical consistency, not just typing: the prompt TELLS the model
+    # "APPROVED only if all three match fields are true and there is no
+    # critical exception" (_build_prompt's decision rules), but a prompt
+    # instruction is not a code-level invariant -- an LLM (or a leader
+    # deliberately returning a crafted payload) could still emit
+    # decision=APPROVED alongside quantity_match=False. Reject that
+    # combination structurally, so it can never reach consensus as a
+    # valid verdict regardless of what any model says.
+    if data["decision"] == DECISION_APPROVED and not (
+        data["quantity_match"]
+        and data["specification_match"]
+        and data["deadline_match"]
+        and not data["critical_exception"]
+    ):
+        return False
     return True
 
 
@@ -238,16 +265,16 @@ def _verdicts_semantically_equal(a: dict, b: dict) -> bool:
     structured fields that matter, never raw prose -- PLUS the fetched
     evidence content hash (`_evidence_content_hash`, computed by this
     contract's own code from what was actually fetched, never supplied by
-    the LLM). That extra comparison is what turns "leader and validator
-    reached the same semantic conclusion" into "leader and validator saw
-    byte-identical evidence content" -- closing the mutable-evidence-URL
-    gap described in the module docstring's Evidence Integrity section: if
-    the content behind an evidence_ref changes between the leader's fetch
-    and a validator's independent re-fetch (whether by coincidence, by a
-    submitter editing a live document mid-flight, or by a malicious host
-    serving different content to different requesters), the hashes won't
-    match, `validator_fn` returns False, and no unsafe state transition
-    happens -- exactly like any other leader/validator disagreement."""
+    the LLM) and the fetch-failure flag.
+
+    IMPORTANT SCOPE LIMIT (do not overclaim this when reusing/reviewing
+    this file): this comparison only proves "leader and validator fetched
+    byte-identical content and reached the same conclusion about it *in
+    this one adjudicate() call*". It does NOT, by itself, prove that
+    content matches what was originally committed to at `submit_evidence`
+    time -- see `submit_evidence`'s docstring for exactly why that
+    specific gap (raised by external audit) is a documented limitation,
+    not something this hash comparison closes."""
     return (
         a["decision"] == b["decision"]
         and a["quantity_match"] == b["quantity_match"]
@@ -255,6 +282,7 @@ def _verdicts_semantically_equal(a: dict, b: dict) -> bool:
         and a["deadline_match"] == b["deadline_match"]
         and a["critical_exception"] == b["critical_exception"]
         and a["_evidence_content_hash"] == b["_evidence_content_hash"]
+        and a["_fetch_failed"] == b["_fetch_failed"]
     )
 
 
@@ -344,6 +372,8 @@ class SemanticObligationGate(gl.Contract):
     ) -> None:
         if not obligation_id.strip():
             raise gl.vm.UserError("obligation_id must not be empty")
+        if len(obligation_id) > MAX_OBLIGATION_ID_CHARS:
+            raise gl.vm.UserError(f"obligation_id too long (max {MAX_OBLIGATION_ID_CHARS} chars)")
         if self._obligation_exists(obligation_id):
             raise gl.vm.UserError(f"obligation already exists: {obligation_id}")
         if not policy.strip():
@@ -397,6 +427,24 @@ class SemanticObligationGate(gl.Contract):
         evidence_refs: list[str],
         evidence_hash: str,
     ) -> None:
+        """`evidence_hash` is a submitter-declared value, stored as-is and
+        NEVER cryptographically verified against fetched content by this
+        contract. This is a deliberate, documented limitation, not an
+        oversight (an earlier draft of this file tried to auto-compare it
+        against the internally-fetched-and-formatted content hash and
+        force `UNDETERMINED` on any mismatch -- that was reverted because
+        no realistic submitter can predict this contract's internal
+        prompt-truncation/formatting exactly, which would have made
+        EVERY normal submission mismatch and degrade to `UNDETERMINED`).
+        Use `get_obligation()`'s `resolved_evidence_hash` field after
+        adjudication for an audit trail of what was actually fetched and
+        agreed upon by consensus -- comparing that, off-chain, against
+        whatever your own process expected is a reasonable manual check,
+        but this contract does not automate it. If you need a real,
+        on-chain-enforceable commitment to evidence content, point
+        `evidence_refs` at content-addressed storage (e.g. an IPFS URI
+        whose CID already is the content hash) instead of a plain mutable
+        URL -- see the module docstring's Evidence Integrity section."""
         obligation = self._get_obligation_or_revert(obligation_id)
 
         sender = gl.message.sender_address
@@ -415,6 +463,13 @@ class SemanticObligationGate(gl.Contract):
             raise gl.vm.UserError(f"too many evidence refs (max {MAX_EVIDENCE_REFS})")
         if not evidence_hash.strip():
             raise gl.vm.UserError("evidence_hash must not be empty")
+        if len(evidence_hash) > MAX_EVIDENCE_HASH_CHARS:
+            raise gl.vm.UserError(f"evidence_hash too long (max {MAX_EVIDENCE_HASH_CHARS} chars)")
+        for ref in evidence_refs:
+            if len(ref) > MAX_EVIDENCE_REF_CHARS:
+                raise gl.vm.UserError(
+                    f"evidence ref too long (max {MAX_EVIDENCE_REF_CHARS} chars): {ref[:50]}..."
+                )
 
         # Idempotent de-duplication of refs within this single submission.
         deduped: list[str] = []
@@ -458,33 +513,44 @@ class SemanticObligationGate(gl.Contract):
         deadline_iso: str = obligation.deadline_iso
         evidence_refs: list[str] = [ref for ref in obligation.evidence_refs][:MAX_EVIDENCE_REFS]
 
-        def _fetch_evidence_text() -> str:
+        def _fetch_evidence_text() -> tuple:
             if not evidence_refs:
-                return "[NO EVIDENCE SUBMITTED]"
+                return "[NO EVIDENCE SUBMITTED]", True
             chunks = []
+            had_failure = False
             for ref in evidence_refs:
                 try:
                     response = gl.nondet.web.request(ref, method="GET")
                     body = response.body.decode("utf-8", errors="replace")
                 except Exception as exc:  # network/parse failure is DATA, not a crash
                     body = f"[EVIDENCE_FETCH_FAILED: {exc}]"
+                    had_failure = True
                 chunks.append(
                     f"--- SOURCE: {ref} ---\n{body[:MAX_EVIDENCE_CHARS_PER_SOURCE]}"
                 )
-            return "\n\n".join(chunks)
+            return "\n\n".join(chunks), had_failure
 
         def _run_adjudication() -> dict:
-            evidence_text = _fetch_evidence_text()
+            evidence_text, fetch_failed = _fetch_evidence_text()
             prompt = _build_prompt(policy_text, deadline_iso, evidence_text)
             raw = gl.nondet.exec_prompt(prompt, response_format="json")
             if not isinstance(raw, dict):
                 raise gl.vm.UserError("LLM did not return a JSON object")
             # Computed by THIS code from what was actually fetched, never by
             # the LLM -- see _verdicts_semantically_equal's docstring for
-            # why this closes the mutable-evidence-URL gap.
+            # exactly what this does and does not prove.
             raw["_evidence_content_hash"] = hashlib.sha256(
                 evidence_text.encode("utf-8")
             ).hexdigest()
+            raw["_fetch_failed"] = fetch_failed
+            # DETERMINISTIC INVARIANT, not a prompt suggestion: a retrieval
+            # failure (or genuinely missing evidence) can NEVER be allowed
+            # to reach APPROVED, no matter what the model says. The prompt
+            # already asks the model to choose UNDETERMINED here, but a
+            # prompt instruction is not an enforced invariant -- this is.
+            if fetch_failed and raw.get("decision") == DECISION_APPROVED:
+                raw["decision"] = DECISION_UNDETERMINED
+                raw["reason_code"] = "EVIDENCE_FETCH_FAILED"
             return raw
 
         def leader_fn():
