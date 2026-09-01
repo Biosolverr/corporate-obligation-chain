@@ -3,7 +3,7 @@
 **Category:** GenLayer Intelligent Contracts.
 **Status:** all three contracts implemented, documented, AND executed for
 real against `genlayer-test==0.29.2` / GenVM v0.2.16 (Direct Mode) --
-**45/45 tests passing** (18 Gate, 21 Router, 6 CertificationGate) -- plus
+**56/56 tests passing** (23 Gate, 27 Router, 6 CertificationGate) -- plus
 one real bug already found and fixed via an actual live Studio deployment
 attempt: Address-typed arguments were arriving as plain `int` instead of
 GenVM's `Address` type (see `docs/architecture.md` §23.8). This is not a
@@ -198,8 +198,14 @@ remain the wrong evidence source for production (use content-addressed
 evidence instead), no rate limit on `adjudicate()` retries, evidence
 truncation can produce false negatives on long documents, and date/quantity
 comparison is 100% LLM-judged rather than partially deterministic — all
-five are named, load-bearing trade-offs now, not silent gaps. 45/45 tests
-pass, including three new regression tests proving the fixes.
+five are named, load-bearing trade-offs now, not silent gaps. An
+independent external audit (see `docs/architecture.md` Part E) then found
+and this project fixed three more real issues (fail-closed on retrieval
+failure, rejecting internally-inconsistent verdicts, obligation
+replay/reuse in the Router) -- and, just as important, correctly declined
+to ship one plausible-sounding but actually-harmful "fix" (auto-comparing
+submitted evidence hashes against an internal, unreproducible format,
+which would have broken every normal submission). 56/56 tests pass.
 
 ## Before you trust this
 
