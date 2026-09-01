@@ -187,8 +187,12 @@ GATE_DECISION_APPROVED = "APPROVED"
 GATE_DECISION_REJECTED = "REJECTED"
 
 HARD_MAX_STAGES_CEILING = 32  # absolute ceiling; deployer cannot exceed this
+HARD_MAX_EDGES_CEILING = 64  # absolute ceiling on edges per graph
 MAX_STAGE_ID_CHARS = 64
 MAX_STAGE_TYPE_CHARS = 64
+MAX_PROCESS_ID_CHARS = 128
+MAX_OBLIGATION_ID_CHARS = 128
+MAX_GRAPH_JSON_CHARS = 20000  # bounds parsing/validation cost before json.loads even runs
 
 
 def _coerce_address(val) -> Address:
@@ -289,12 +293,20 @@ def _validate_dag_payload(payload: dict, max_stages: int):
             raise gl.vm.UserError("stage_id too long")
         if len(s["stage_type"]) > MAX_STAGE_TYPE_CHARS:
             raise gl.vm.UserError("stage_type too long")
+        if len(s["obligation_id"]) > MAX_OBLIGATION_ID_CHARS:
+            raise gl.vm.UserError("obligation_id too long")
         if not isinstance(s.get("mandatory"), bool):
             raise gl.vm.UserError(f"stage {s['stage_id']}: 'mandatory' must be a boolean")
         if s["stage_id"] in seen_stage_ids:
             raise gl.vm.UserError(f"duplicate stage_id in graph: {s['stage_id']}")
         seen_stage_ids.add(s["stage_id"])
 
+    if len(raw_edges) > HARD_MAX_EDGES_CEILING:
+        raise gl.vm.UserError(
+            f"too many edges ({len(raw_edges)}), max is {HARD_MAX_EDGES_CEILING}"
+        )
+
+    seen_edges = set()
     for e in raw_edges:
         if not isinstance(e, dict):
             raise gl.vm.UserError("each edge must be a JSON object")
@@ -307,6 +319,12 @@ def _validate_dag_payload(payload: dict, max_stages: int):
             raise gl.vm.UserError(f"edge references unknown stage_id: {e['stage_id']}")
         if e["depends_on"] not in seen_stage_ids:
             raise gl.vm.UserError(f"edge references unknown depends_on: {e['depends_on']}")
+        edge_key = (e["stage_id"], e["depends_on"])
+        if edge_key in seen_edges:
+            raise gl.vm.UserError(
+                f"duplicate edge: {e['stage_id']} depends_on {e['depends_on']}"
+            )
+        seen_edges.add(edge_key)
 
     _assert_acyclic(seen_stage_ids, raw_edges)
     return raw_stages, raw_edges
@@ -357,6 +375,16 @@ class ProcessGraphRouter(gl.Contract):
     registered_stage_types: DynArray[str]
     processes: TreeMap[str, ProcessGraph]
     process_ids: DynArray[str]
+    # Router-wide (not per-process) record of every obligation_id ever
+    # bound to a stage in any registered process. Closes two related
+    # external-audit findings: (1) cross-process obligation replay -- an
+    # already-APPROVED obligation from one process being reused to fake
+    # completion of an unrelated process's stage, and (2) intra-graph
+    # obligation reuse -- two different stage_id entries in the SAME graph
+    # pointing at the same obligation_id, letting one real adjudication
+    # masquerade as several independent logical approvals. See
+    # `_is_obligation_claimed` and `register_process`.
+    claimed_obligation_ids: DynArray[str]
 
     def __init__(self, gate_address: Address, max_stages_per_process: u32):
         gate_address = _coerce_address(gate_address)
@@ -394,6 +422,12 @@ class ProcessGraphRouter(gl.Contract):
     def _process_exists(self, process_id: str) -> bool:
         for existing in self.process_ids:
             if existing == process_id:
+                return True
+        return False
+
+    def _is_obligation_claimed(self, obligation_id: str) -> bool:
+        for existing in self.claimed_obligation_ids:
+            if existing == obligation_id:
                 return True
         return False
 
@@ -479,8 +513,12 @@ class ProcessGraphRouter(gl.Contract):
     def register_process(self, process_id: str, graph_json: str) -> None:
         if not process_id.strip():
             raise gl.vm.UserError("process_id must not be empty")
+        if len(process_id) > MAX_PROCESS_ID_CHARS:
+            raise gl.vm.UserError(f"process_id too long (max {MAX_PROCESS_ID_CHARS} chars)")
         if self._process_exists(process_id):
             raise gl.vm.UserError(f"process already exists: {process_id}")
+        if len(graph_json) > MAX_GRAPH_JSON_CHARS:
+            raise gl.vm.UserError(f"graph_json too large (max {MAX_GRAPH_JSON_CHARS} chars)")
 
         try:
             payload = json.loads(graph_json)
@@ -488,6 +526,29 @@ class ProcessGraphRouter(gl.Contract):
             raise gl.vm.UserError(f"graph_json is not valid JSON: {exc}")
 
         raw_stages, raw_edges = _validate_dag_payload(payload, self.max_stages_per_process)
+
+        # Cheap, purely local pre-check (no cross-contract calls) for
+        # intra-graph obligation reuse -- two different stage_id entries in
+        # THIS SAME graph pointing at the same obligation_id. Checked
+        # up front, before any cross-contract call, both so it fails fast
+        # and so it can be verified without a live Gate deployment (see
+        # tests/test_process_graph_router.py). Cross-PROCESS reuse (the
+        # same obligation_id claimed by an EARLIER, already-registered
+        # process) is checked below, per-stage, against
+        # `claimed_obligation_ids` -- that check does require the
+        # cross-contract ownership read to be reached first, so it can
+        # only be verified live (glsim/Studio), same as the ownership
+        # check itself.
+        seen_obligation_ids_in_this_graph = set()
+        for s in raw_stages:
+            oid = s["obligation_id"]
+            if oid in seen_obligation_ids_in_this_graph:
+                raise gl.vm.UserError(
+                    f"obligation '{oid}' is referenced by more than one "
+                    f"stage in this graph -- each obligation may only "
+                    f"back one stage"
+                )
+            seen_obligation_ids_in_this_graph.add(oid)
 
         stages: list[StageRef] = []
         for s in raw_stages:
@@ -499,6 +560,21 @@ class ProcessGraphRouter(gl.Contract):
                 )
             expected_authority = self.authority_registry[stage_type]
 
+            # Closes external-audit findings #4/#5: an obligation_id that
+            # is already bound to ANY stage of ANY process (this graph's
+            # own earlier stages included, since claims are recorded
+            # incrementally within this same loop) can never be reused.
+            # Without this, a valid, unrelated APPROVED obligation could
+            # be replayed into a brand-new, otherwise-fake process, or the
+            # same single adjudication could be double/triple-counted as
+            # several independent stages within one graph.
+            if self._is_obligation_claimed(s["obligation_id"]):
+                raise gl.vm.UserError(
+                    f"obligation '{s['obligation_id']}' is already bound to "
+                    f"another stage or process -- an obligation may only "
+                    f"ever be used for one stage, once"
+                )
+
             obligation = self._read_gate_obligation(s["obligation_id"])
             if obligation["buyer"] != expected_authority:
                 raise gl.vm.UserError(
@@ -508,6 +584,7 @@ class ProcessGraphRouter(gl.Contract):
                     f"refusing to trust it as evidence of that stage"
                 )
 
+            self.claimed_obligation_ids.append(s["obligation_id"])
             stages.append(
                 StageRef(
                     stage_id=s["stage_id"],
