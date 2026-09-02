@@ -71,20 +71,23 @@ the full argument.
 ## What's in this repo right now
 
 ```
-contracts/semantic_obligation_gate.py   the adjudication primitive — 14/14 tests pass
-contracts/process_graph_router.py       the DAG orchestrator — 19/19 tests pass
-contracts/certification_gate.py         the deterministic terminal step — 5/5 tests pass
+contracts/semantic_obligation_gate.py   the adjudication primitive — 23/23 tests pass
+contracts/process_graph_router.py       the DAG orchestrator — 27/27 tests pass
+contracts/certification_gate.py         the deterministic terminal step — 6/6 tests pass
 tests/test_semantic_gate.py             Direct Mode tests, executed
 tests/test_process_graph_router.py      Direct Mode tests, executed (Router-isolated scope)
 tests/test_certification_gate.py        Direct Mode tests, executed (isolated scope)
 deploy/STUDIO_TESTING_GUIDE.md          manual live cross-contract test sequence
-docs/architecture.md                    full design doc, threat model, limitations, verification log
+deploy/LIVE_RESULTS.md                  real transaction record from live Studio runs
+docs/architecture.md                    design/architecture — data model, state machine, consensus model
+docs/SECURITY.md                        everything security: threat model, limitations, audit history
 ```
 
-All three contracts now exist. What's left is not writing more code — it's
-the live cross-contract verification that Direct Mode cannot provide by
-construction (GenVM allows only one contract per process in that mode; see
-`docs/architecture.md` §23.4). See §10 for the exact step order followed.
+All three contracts now exist and have been deployed live on GenLayer
+Studio. See `docs/SECURITY.md` for the full security picture and
+`deploy/LIVE_RESULTS.md` for the real transaction record, including a
+live-confirmed rejection of an obligation-replay attack. See
+`docs/architecture.md` §10 for the development order followed.
 
 ## Contract APIs
 
@@ -179,71 +182,40 @@ verdict X." The Router establishes only "these already-consensus-backed
 verdicts satisfy this dependency graph's completion condition." Neither is
 a court; neither performs independent physical-world verification.
 
-## Adversarial self-review (found and fixed before any reviewer had to)
+## Security, limitations, and audit history
 
-After live Studio testing worked end-to-end, a deliberate second pass
-asked "what would a hostile reviewer find next" across all three
-contracts — see `docs/architecture.md` Part D (§28). The headline finding:
-**evidence URLs are mutable, and nothing previously required a leader and
-a validator to have fetched byte-identical content** — only that they
-reached the same high-level decision. Fixed by adding a
-`_evidence_content_hash` (computed by contract code from what was
-actually fetched, never by the LLM) to the consensus-compared fields, and
-persisting the agreed hash on-chain as `resolved_evidence_hash`. Also
-closed: no cap on `policy` length, no validation that `deadline_iso` is a
-real date. Also confirmed (no code change needed): `gate_address` and
-`router_address` cannot be swapped post-deployment by anyone, including
-admin. Also documented, deliberately not fixed yet: mutable evidence URLs
-remain the wrong evidence source for production (use content-addressed
-evidence instead), no rate limit on `adjudicate()` retries, evidence
-truncation can produce false negatives on long documents, and date/quantity
-comparison is 100% LLM-judged rather than partially deterministic — all
-five are named, load-bearing trade-offs now, not silent gaps. An
-independent external audit (see `docs/architecture.md` Part E) then found
-and this project fixed three more real issues (fail-closed on retrieval
-failure, rejecting internally-inconsistent verdicts, obligation
-replay/reuse in the Router) -- and, just as important, correctly declined
-to ship one plausible-sounding but actually-harmful "fix" (auto-comparing
-submitted evidence hashes against an internal, unreproducible format,
-which would have broken every normal submission). 56/56 tests pass.
+All of it lives in `docs/SECURITY.md` now, not here or in
+`docs/architecture.md` -- threat model coverage for all three contracts,
+every known limitation (closed and still-open), the post-live-testing
+adversarial self-review, and an independent external audit's findings,
+each with what was fixed, what was deliberately left alone, and why. One
+highlight worth surfacing here: the external audit's most important
+finding (evidence URLs are mutable, so nothing guaranteed a leader and a
+validator fetched identical content) is fixed, and a plausible-sounding
+but actually-harmful "fix" for a related finding was caught and reverted
+before shipping -- see `docs/SECURITY.md` §9, finding #1, for the full
+story of why that mattered.
 
 ## Before you trust this
 
-1. ~~`pip install genlayer-test && pytest tests/ -v`~~ **done this
-   session** -- 38/38 pass. Re-run yourself to confirm:
-   `pip install genlayer-test && pytest tests/ -v` (pins `sdk_version="v0.2.16"`
-   internally -- see §23.1 for why that pin currently matters).
-2. ~~Confirm `hashlib.sha256` / `json.loads` run inside GenVM~~ **confirmed**
-   by the test run above (§9.1, §22.3) -- still worth one Studio smoke test
-   since Direct Mode's Python runtime and the on-chain WASM one could in
-   principle diverge, though nothing found this session suggests they would.
-3. ~~Confirm `gl.storage.Root.get().upgraders.get().append(...)`
-   behaves as documented~~ **confirmed** -- every Router deployment in the
-   test run executes this in `__init__` without error, and
-   `renounce_admin()`/`freeze_upgrades()` (the two admin-exit paths) are
-   both confirmed working and confirmed independent of each other (§22.5,
-   §23 limitation #6).
-4. **Still open:** run at least one adversarial-evidence adjudication
-   against a real model in Studio before relying on the prompt-injection
-   claims in `docs/architecture.md` §5/§9.3 -- Direct Mode mocks the LLM,
-   so this specific claim genuinely needs a live model.
-5. **Still open, and structural, not just untried:** every cross-contract
-   code path in this repo -- the Router's spoofed-obligation check,
-   `get_unblocked_stages`, `refresh_process_status`, and
-   CertificationGate's `claim_eligibility` -- cannot be exercised in Direct
-   Mode at all. GenVM enforces one contract per process, so two contracts
-   can never both be live in the same Direct Mode session. Needs either a
-   glsim harness or GenLayer's Integration Testing mode against a running
-   localnet -- `deploy/STUDIO_TESTING_GUIDE.md` is the manual sequence for
-   exactly this. See `docs/architecture.md` §23.4.
+1. `pip install genlayer-test && pytest tests/ -v` -- 56/56 pass as of
+   this writing; re-run it yourself to confirm on your machine (pins
+   `sdk_version="v0.2.16"` internally -- see `docs/architecture.md` §23.1
+   for why that pin currently matters).
+2. Read `docs/SECURITY.md` -- it states plainly what's closed, what's
+   confirmed-safe-by-design, and what's still an open, named trade-off
+   (prompt-injection resistance against a real model, evidence-hash
+   commitment strength, retry-cost griefing, and a few others).
+3. All three contracts have now been deployed and exercised live on
+   GenLayer Studio, including a live-confirmed rejection of an
+   obligation-replay attack -- see `deploy/LIVE_RESULTS.md` for the full
+   transaction record, and `deploy/STUDIO_TESTING_GUIDE.md` if you want to
+   reproduce it yourself.
 
 ## Next
 
-Not more contracts -- all three planned contracts exist now. The next step
-is live verification: work through `deploy/STUDIO_TESTING_GUIDE.md` on
-GenLayer Studio (deploy order: Gate, then Router with the Gate's address,
-then CertificationGate with the Router's address) and report back
-pass/fail per step, especially the "spoofed obligation" rejection and the
-`get_unblocked_stages` parallel-unblocking behavior -- those are the two
-things this whole project exists to guarantee, and neither has been
-verified against real cross-contract execution yet.
+All three planned contracts exist and have been proven both in Direct
+Mode (56/56 tests) and live on Studio (`deploy/LIVE_RESULTS.md`). What's
+left is exactly what `docs/SECURITY.md` lists as still open -- most
+notably a live adversarial-evidence adjudication against a real model to
+test prompt-injection resistance under real conditions, not mocked ones.
