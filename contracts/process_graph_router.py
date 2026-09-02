@@ -91,14 +91,34 @@ A naive router would accept any obligation_id a caller supplies for a given
 stage_type, including one that belongs to a completely unrelated process
 approved by nobody relevant (e.g. reusing someone else's already-APPROVED
 obligation to fake completion of an unrelated permit's fire-safety stage).
-`register_process` closes this by cross-contract-reading each referenced
-obligation's `buyer` field from the Gate and checking it equals the
-registered authority address for that stage's `stage_type`. Since `buyer`
-on the Gate is set once, at obligation creation, by whoever called
-`create_obligation` (and cannot be changed afterward -- see
-semantic_obligation_gate.py's Obligation dataclass, no method mutates
-`buyer`), this check is not spoofable by the process registrant: they would
-need control of the real authority's private key to pass it.
+`register_process` closes the address-spoofing half of this by
+cross-contract-reading each referenced obligation's `buyer` field from the
+Gate and checking it equals the registered authority address for that
+stage's `stage_type`. Since `buyer` on the Gate is set once, at obligation
+creation, by whoever called `create_obligation` (and cannot be changed
+afterward -- see semantic_obligation_gate.py's Obligation dataclass, no
+method mutates `buyer`), that half is not spoofable by the process
+registrant: they would need control of the real authority's private key to
+pass it.
+
+CLOSING THE "WRONG STAGE_TYPE, SAME AUTHORITY" HOLE (post-review fix)
+-------------------------------------------------------------------------
+The address check above is NECESSARY but was not SUFFICIENT. The Gate has
+no concept of `stage_type` at all -- it only knows buyer/supplier/policy.
+If the same real-world authority address is registered here for more than
+one `stage_type` (a realistic, even common, setup -- see this project's own
+`deploy/STUDIO_TESTING_GUIDE.md` reference scenario, which deliberately uses
+one `AUTHORITY` address for `fire_safety`, `sanitary`, AND `final_review`
+"for simplicity"), an obligation the authority created with a `sanitary`
+policy would satisfy the address check for a `fire_safety` stage just as
+well, on its FIRST use -- `claimed_obligation_ids` only ever prevented
+*reuse*, never a mismatch on first use. `register_process` now also
+requires each referenced `obligation_id` to have been explicitly bound to
+its `stage_type` beforehand, by that stage_type's own authority, via
+`bind_obligation_stage_type`. An authority governing several `stage_type`s
+must call it once per obligation, declaring which stage that specific
+obligation is for -- closing the gap by construction rather than by
+convention.
 
 DETERMINISM
 ---------------
@@ -111,7 +131,11 @@ across every validator.
 STATE MACHINE (per registered process)
 -------------------------------------------
     ACTIVE --refresh_process_status()--> COMPLETE   (all mandatory stages APPROVED)
-    ACTIVE --refresh_process_status()--> FAILED      (any mandatory stage REJECTED)
+    ACTIVE --refresh_process_status()--> FAILED      (a mandatory stage REJECTED, or
+                                                       any stage that gates another
+                                                       stage is REJECTED -- see
+                                                       "Closing the dead-end hole"
+                                                       below)
     ACTIVE --refresh_process_status()--> ACTIVE       (no change; still pending)
 
 FAILED and COMPLETE are terminal at the router level. This is safe because
@@ -119,6 +143,27 @@ FINALIZED is itself terminal on the Gate (semantic_obligation_gate.py
 blocks resubmission and re-adjudication once an obligation is FINALIZED),
 so a stage that has reached REJECTED or APPROVED cannot later flip -- the
 router's terminal states cannot be invalidated by a later Gate write.
+
+CLOSING THE "NON-MANDATORY REJECTED DEPENDENCY DEAD-END" HOLE (post-review
+fix)
+-------------------------------------------------------------------------
+`refresh_process_status` used to only check MANDATORY stages for a REJECTED
+verdict when deciding whether to mark the whole process FAILED. But
+`get_unblocked_stages` requires ANY dependency -- mandatory or not -- to be
+FINALIZED+APPROVED before something depending on it can unblock. REJECTED
+is terminal on the Gate (no re-adjudication once FINALIZED). Combine those
+two facts and a non-mandatory stage that some other stage depends on could
+be REJECTED and permanently block that dependent stage from ever unblocking
+-- while the process itself stayed ACTIVE forever, because the REJECTED
+stage was never itself mandatory. This was a genuine, previously
+unaddressed dead-end distinct from the already-documented "no timeout for
+UNDETERMINED" limitation: UNDETERMINED always has a path forward (re-submit
+better evidence, re-adjudicate); a terminal REJECTED on a stage something
+else depends on has none. `refresh_process_status` now also treats a
+REJECTED stage as fatal to the whole process whenever it appears as a
+`depends_on` target of any edge in the graph, regardless of its own
+`mandatory` flag -- a non-mandatory stage nothing else depends on can still
+be REJECTED without failing the process, exactly as before.
 
 KNOWN LIMITATIONS (stated, not hidden)
 -------------------------------------------
@@ -164,6 +209,11 @@ KNOWN LIMITATIONS (stated, not hidden)
    intentional -- process registration snapshots trust at the moment it
    happens, the same way `SemanticObligationGate.policy_hash` snapshots a
    policy at obligation-creation time -- not a silent gap.
+6. `bind_obligation_stage_type` bindings are permanent and one-per-
+   obligation, by the same design logic as `claimed_obligation_ids`: an
+   authority declares intent once, and that declaration cannot later be
+   changed to retroactively alter what an already-registered (or
+   not-yet-registered) process is trusting that obligation to mean.
 """
 
 import json
@@ -212,13 +262,22 @@ def _coerce_address(val) -> Address:
     already-correct `Address` unchanged, or coerce from `int` / `bytes` /
     a hex-or-base64 string (verified against `genlayer.py.types.Address`'s
     real constructor, which already accepts all of those except `int`).
+
+    Closed post-review finding: a negative `int`, or one wider than
+    `Address.SIZE` bytes, previously reached `int.to_bytes` unguarded and
+    raised a raw `OverflowError`/`ValueError` instead of the
+    `gl.vm.UserError` every other input-validation failure in this file
+    uses.
     """
     if hasattr(val, "as_bytes"):
         return val
     if isinstance(val, bool):
         raise gl.vm.UserError(f"invalid address value: {val!r}")
     if isinstance(val, int):
-        return Address(val.to_bytes(Address.SIZE, "big"))
+        try:
+            return Address(val.to_bytes(Address.SIZE, "big"))
+        except (OverflowError, ValueError):
+            raise gl.vm.UserError(f"invalid address value: {val!r}")
     if isinstance(val, (bytes, bytearray, memoryview)):
         return Address(bytes(val))
     if isinstance(val, str):
@@ -385,6 +444,13 @@ class ProcessGraphRouter(gl.Contract):
     # masquerade as several independent logical approvals. See
     # `_is_obligation_claimed` and `register_process`.
     claimed_obligation_ids: DynArray[str]
+    # Post-review addition: obligation_id -> stage_type, set exactly once
+    # by the obligation's own authority via `bind_obligation_stage_type`.
+    # Closes the "same authority, wrong stage_type" gap -- see module
+    # docstring. `bound_obligation_ids` is the existence-tracking list,
+    # same pattern as everywhere else in this file.
+    obligation_stage_types: TreeMap[str, str]
+    bound_obligation_ids: DynArray[str]
 
     def __init__(self, gate_address: Address, max_stages_per_process: u32):
         gate_address = _coerce_address(gate_address)
@@ -427,6 +493,12 @@ class ProcessGraphRouter(gl.Contract):
 
     def _is_obligation_claimed(self, obligation_id: str) -> bool:
         for existing in self.claimed_obligation_ids:
+            if existing == obligation_id:
+                return True
+        return False
+
+    def _is_obligation_bound(self, obligation_id: str) -> bool:
+        for existing in self.bound_obligation_ids:
             if existing == obligation_id:
                 return True
         return False
@@ -506,6 +578,61 @@ class ProcessGraphRouter(gl.Contract):
         root.lock_default()
 
     # ---------------------------------------------------------------- #
+    # Obligation <-> stage_type binding (post-review addition)
+    # ---------------------------------------------------------------- #
+
+    @gl.public.write
+    def bind_obligation_stage_type(self, obligation_id: str, stage_type: str) -> None:
+        """Must be called by an obligation's own authority before that
+        obligation can be referenced by `register_process` for
+        `stage_type`. Closes a gap where an obligation created by an
+        authority that governs more than one `stage_type` on this Router
+        could otherwise be accepted for the wrong `stage_type` on its
+        FIRST use (the pre-existing `claimed_obligation_ids` check only
+        ever prevented *reuse*, not a mismatch on first use) -- checking
+        only `obligation.buyer == authority_registry[stage_type]` is
+        necessary but not sufficient, since the Gate itself has no notion
+        of `stage_type` and the same authority address may legitimately be
+        registered for several.
+
+        This grants no new authority: it only succeeds for a caller who is
+        BOTH the registered authority for `stage_type` AND the `buyer` of
+        `obligation_id` on the Gate -- it lets a real authority explicitly
+        declare, once, which stage_type a specific obligation is for,
+        before `register_process` will trust that binding. A given
+        `obligation_id` may be bound exactly once, permanently (never
+        reassigned), the same finality pattern as `claimed_obligation_ids`.
+        """
+        if not obligation_id.strip():
+            raise gl.vm.UserError("obligation_id must not be empty")
+        if len(obligation_id) > MAX_OBLIGATION_ID_CHARS:
+            raise gl.vm.UserError(f"obligation_id too long (max {MAX_OBLIGATION_ID_CHARS} chars)")
+        if not self._is_stage_type_registered(stage_type):
+            raise gl.vm.UserError(
+                f"no authority registered for stage_type '{stage_type}' "
+                f"-- call register_authority first"
+            )
+        expected_authority = self.authority_registry[stage_type]
+        if gl.message.sender_address != expected_authority:
+            raise gl.vm.UserError(
+                "only the registered authority for this stage_type may "
+                "bind an obligation to it"
+            )
+        if self._is_obligation_bound(obligation_id):
+            raise gl.vm.UserError(
+                f"obligation '{obligation_id}' is already bound to a stage_type"
+            )
+
+        obligation = self._read_gate_obligation(obligation_id)
+        if obligation["buyer"] != expected_authority:
+            raise gl.vm.UserError(
+                f"obligation '{obligation_id}' was not created by this authority"
+            )
+
+        self.obligation_stage_types[obligation_id] = stage_type
+        self.bound_obligation_ids.append(obligation_id)
+
+    # ---------------------------------------------------------------- #
     # Process registration
     # ---------------------------------------------------------------- #
 
@@ -546,7 +673,7 @@ class ProcessGraphRouter(gl.Contract):
                 raise gl.vm.UserError(
                     f"obligation '{oid}' is referenced by more than one "
                     f"stage in this graph -- each obligation may only "
-                    f"back one stage"
+                    f"ever be used for one stage, once"
                 )
             seen_obligation_ids_in_this_graph.add(oid)
 
@@ -575,6 +702,35 @@ class ProcessGraphRouter(gl.Contract):
                     f"ever be used for one stage, once"
                 )
 
+            # Post-review fix: the address check below only proves "this
+            # obligation was created by an address that IS an authority
+            # for some stage_type" -- not "this obligation was designated
+            # by its authority as being FOR this stage_type". If one
+            # address is registered as authority for more than one
+            # stage_type, that is not enough. Require an explicit,
+            # authority-signed binding first -- see
+            # `bind_obligation_stage_type` and the module docstring.
+            if not self._is_obligation_bound(s["obligation_id"]):
+                raise gl.vm.UserError(
+                    f"obligation '{s['obligation_id']}' for stage "
+                    f"'{s['stage_id']}' has not been bound to a stage_type "
+                    f"by its authority yet -- the authority must call "
+                    f"bind_obligation_stage_type('{s['obligation_id']}', "
+                    f"'{stage_type}') before this process can be registered"
+                )
+            bound_stage_type = self.obligation_stage_types[s["obligation_id"]]
+            if bound_stage_type != stage_type:
+                raise gl.vm.UserError(
+                    f"obligation '{s['obligation_id']}' is bound to "
+                    f"stage_type '{bound_stage_type}', not '{stage_type}' "
+                    f"-- refusing to trust it as evidence of the wrong stage"
+                )
+
+            # Kept as defense-in-depth even though `bind_obligation_stage_type`
+            # already checked this at bind time: `buyer` is immutable on the
+            # Gate once an obligation is created (see
+            # semantic_obligation_gate.py), so this can only ever
+            # re-confirm what the binding already established.
             obligation = self._read_gate_obligation(s["obligation_id"])
             if obligation["buyer"] != expected_authority:
                 raise gl.vm.UserError(
@@ -673,10 +829,24 @@ class ProcessGraphRouter(gl.Contract):
         """Permissionless, like Gate's adjudicate(): anyone may trigger a
         re-check. Monotonic -- ACTIVE can move to FAILED or COMPLETE, but
         FAILED/COMPLETE never move again (safe because FINALIZED is
-        terminal on the Gate; see module docstring)."""
+        terminal on the Gate; see module docstring).
+
+        Post-review fix: a REJECTED stage now fails the whole process not
+        only when that stage is itself `mandatory`, but also whenever it
+        appears as a `depends_on` target of any edge in the graph -- i.e.
+        whenever something else's readiness depends on it. REJECTED is
+        terminal on the Gate (no re-adjudication once FINALIZED), and
+        `get_unblocked_stages` never treats a REJECTED dependency as
+        satisfied, so leaving a non-mandatory-but-depended-on REJECTED
+        stage out of the FAILED check used to leave the process stuck
+        ACTIVE forever with no path to FAILED or COMPLETE. A non-mandatory
+        stage that nothing else depends on can still be REJECTED without
+        failing the process, exactly as before."""
         graph = self._get_process_or_revert(process_id)
         if graph.status != STATUS_ACTIVE:
             return  # already terminal; nothing to do, not an error
+
+        depended_on_stage_ids: list[str] = [edge.depends_on for edge in graph.edges]
 
         any_pending_mandatory = False
         for stage in graph.stages:
@@ -684,7 +854,8 @@ class ProcessGraphRouter(gl.Contract):
             status = obligation["status"]
             decision = obligation["decision"]
 
-            if stage.mandatory and status == GATE_STATUS_FINALIZED and decision == GATE_DECISION_REJECTED:
+            gates_something = stage.mandatory or stage.stage_id in depended_on_stage_ids
+            if gates_something and status == GATE_STATUS_FINALIZED and decision == GATE_DECISION_REJECTED:
                 graph.status = STATUS_FAILED
                 graph.updated_at = datetime.now(timezone.utc).isoformat()
                 self.processes[process_id] = graph
