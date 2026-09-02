@@ -373,3 +373,66 @@ def test_empty_evidence_refs_rejected(direct_vm, direct_deploy):
     with direct_vm.prank(bob):
         with direct_vm.expect_revert("must not be empty"):
             contract.submit_evidence("po-1", [], "hash-1")
+
+# ДОБАВИТЬ В КОНЕЦ tests/test_semantic_gate.py
+
+# --------------------------------------------------------------------- #
+# Post-review regression tests
+# --------------------------------------------------------------------- #
+
+
+def test_contradictory_rejected_verdict_is_invalid(direct_vm, direct_deploy):
+    """Closed post-review finding: decision=REJECTED (or UNDETERMINED)
+    alongside all three match fields True and critical_exception False is
+    internally contradictory by this system's own decision rules (it
+    should have been APPROVED) -- `_is_valid_verdict` must reject it
+    structurally, not just check APPROVED's own direction."""
+    contract = _deploy(direct_deploy)
+    alice, bob = _addr("alice"), _addr("bob")
+    _create_and_submit(contract, direct_vm, alice, bob)
+
+    contradictory_rejected = json.dumps(
+        {
+            "decision": "REJECTED",
+            "quantity_match": True,
+            "specification_match": True,
+            "deadline_match": True,
+            "critical_exception": False,
+            "reason_code": "SHOULD_BE_IMPOSSIBLE",
+        }
+    )
+    direct_vm.mock_llm(r".*", contradictory_rejected)
+    contract.adjudicate("po-1")
+
+    # validator_fn must reject the internally-contradictory leader result.
+    assert direct_vm.run_validator() is False
+
+
+def test_fetch_failure_hash_ignores_exception_wording(direct_vm, direct_deploy):
+    """Closed post-review finding: `_evidence_content_hash` for a FAILED
+    fetch must be computed from a fixed, content-free marker, never the
+    raw exception text -- otherwise leader and validator could disagree
+    on the hash even when both genuinely saw the same class of failure
+    (source completely unreachable), breaking consensus in exactly the
+    case this fetch-failure handling exists to route safely to
+    UNDETERMINED. This test can only confirm the code path taken (the
+    override still fires, and the same result is produced twice, matching
+    what "consensus agrees" needs) -- Direct Mode mocks the same exception
+    identically for both fetch attempts by construction, so it cannot by
+    itself reproduce genuinely different exception wording across nodes;
+    see the docstring on `_fetch_evidence_text` for the reasoning that
+    closes the gap regardless."""
+    contract = _deploy(direct_deploy)
+    alice, bob = _addr("alice"), _addr("bob")
+    _create_and_submit(contract, direct_vm, alice, bob)
+
+    # Evidence URL is left entirely unmocked -> Direct Mode raises a fetch
+    # error; LLM is mocked to (incorrectly) say APPROVED anyway.
+    direct_vm.mock_llm(r".*", APPROVED_JSON)
+    contract.adjudicate("po-1")
+
+    assert contract.get_status("po-1") == "UNDETERMINED"
+    assert contract.get_verdict("po-1")["reason_code"] == "EVIDENCE_FETCH_FAILED"
+    # Re-deriving independently must still agree (same fixed marker
+    # regardless of the exact exception raised on each attempt).
+    assert direct_vm.run_validator() is True
