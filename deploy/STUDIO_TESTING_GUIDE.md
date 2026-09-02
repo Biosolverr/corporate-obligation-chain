@@ -5,17 +5,33 @@ Everything below is untested by me beyond Direct Mode (see
 exercises the parts Direct Mode structurally cannot: the real
 cross-contract calls between all three contracts.
 
-## Deploy order (must be this order -- each step needs the previous
-contract's address)
-
-1. Deploy `contracts/semantic_obligation_gate.py`. No constructor args.
-   Note its address as `GATE_ADDR`.
-2. Deploy `contracts/process_graph_router.py` with args
-   `(gate_address=GATE_ADDR, max_stages_per_process=8)` (or any value
-   1-32). Note its address as `ROUTER_ADDR`. The deploying account becomes
-   `admin`.
-3. Deploy `contracts/certification_gate.py` with args
-   `(router_address=ROUTER_ADDR)`. No further setup needed.
+1. As `admin`, on the Router:
+   `register_authority("fire_safety", AUTHORITY)`
+   `register_authority("sanitary", AUTHORITY)`
+   `register_authority("final_review", AUTHORITY)`
+2. As `AUTHORITY`, on the Gate, create three obligations (the *authority*
+   is `buyer` -- see architecture.md §12 role-reversal note, this is
+   intentional):
+   `create_obligation("permit-1:fire_safety", APPLICANT, "<policy text>", "<deadline iso>")`
+   `create_obligation("permit-1:sanitary", APPLICANT, "<policy text>", "<deadline iso>")`
+   `create_obligation("permit-1:final_review", APPLICANT, "<policy text>", "<deadline iso>")`
+2a. **NEW, post-review, required:** as `AUTHORITY`, on the Router, bind
+   each obligation to its stage_type before registering the process --
+   this is a new requirement closing a gap where one `AUTHORITY` address
+   registered for multiple `stage_type`s (exactly this scenario) could
+   otherwise have an obligation meant for one stage_type silently accepted
+   for another:
+   `bind_obligation_stage_type("permit-1:fire_safety", "fire_safety")`
+   `bind_obligation_stage_type("permit-1:sanitary", "sanitary")`
+   `bind_obligation_stage_type("permit-1:final_review", "final_review")`
+3. As anyone, on the Router:
+   `register_process("permit-1", '{"stages":[...3 stages...],"edges":[{"stage_id":"final_review","depends_on":"fire_safety"},{"stage_id":"final_review","depends_on":"sanitary"}]}')`
+   **This is the step that needs live cross-contract verification** --
+   confirm it reverts if a stage's `obligation_id` was created by someone
+   OTHER than the registered authority (the "spoofed obligation" test from
+   §14, untestable in Direct Mode), AND confirm it reverts if step 2a was
+   skipped for any stage (the "wrong stage_type, same authority" test,
+   also untestable in Direct Mode).
 
 ## Reference scenario ("Administratum" -- two independent checks + one
 converging final review)
