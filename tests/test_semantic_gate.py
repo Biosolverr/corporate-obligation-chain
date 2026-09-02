@@ -374,7 +374,6 @@ def test_empty_evidence_refs_rejected(direct_vm, direct_deploy):
         with direct_vm.expect_revert("must not be empty"):
             contract.submit_evidence("po-1", [], "hash-1")
 
-# ДОБАВИТЬ В КОНЕЦ tests/test_semantic_gate.py
 
 # --------------------------------------------------------------------- #
 # Post-review regression tests
