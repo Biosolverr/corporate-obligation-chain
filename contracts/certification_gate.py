@@ -119,13 +119,23 @@ def _coerce_address(val) -> Address:
     coercion applied here for consistency, since this contract has the
     same single-Address-constructor-argument shape). See
     process_graph_router.py's copy of this function for the full
-    writeup."""
+    writeup.
+
+    Closed post-review finding: a negative `int`, or one wider than
+    `Address.SIZE` bytes, previously reached `int.to_bytes` unguarded and
+    raised a raw `OverflowError`/`ValueError` instead of the
+    `gl.vm.UserError` every other input-validation failure in this file
+    uses.
+    """
     if hasattr(val, "as_bytes"):
         return val
     if isinstance(val, bool):
         raise gl.vm.UserError(f"invalid address value: {val!r}")
     if isinstance(val, int):
-        return Address(val.to_bytes(Address.SIZE, "big"))
+        try:
+            return Address(val.to_bytes(Address.SIZE, "big"))
+        except (OverflowError, ValueError):
+            raise gl.vm.UserError(f"invalid address value: {val!r}")
     if isinstance(val, (bytes, bytearray, memoryview)):
         return Address(bytes(val))
     if isinstance(val, str):
