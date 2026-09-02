@@ -72,6 +72,21 @@ guidance to prefer custom `run_nondet_unsafe` validator functions and to
 compare "the parts that matter", not open-ended text
 (developers/intelligent-contracts/when-to-use-genlayer).
 
+The comparison also includes `_evidence_content_hash` and `_fetch_failed`
+(see `_verdicts_semantically_equal`). IMPORTANT, closed post-review finding:
+`_evidence_content_hash` is computed from a NORMALIZED representation of
+what was fetched, not the raw text shown to the LLM. A failed fetch's raw
+exception message (timeout wording, DNS error text, etc.) is not guaranteed
+to be identical across independently-selected nodes even when every node is
+reporting the exact same underlying failure ("this source is unreachable").
+Hashing that raw, non-deterministic text would make leader and validator
+disagree on `_evidence_content_hash` precisely in the "source completely
+down" case — which is exactly the case this contract is supposed to route
+safely to UNDETERMINED, not fail to reach consensus on at all. See
+`_fetch_evidence_text`'s docstring for the fix: only the FACT of a fetch
+failure (already carried by the `_fetch_failed` boolean) participates in the
+hash for a failed source, never the exact wording of the failure.
+
 STATE MACHINE
 -----------------
     CREATED -> EVIDENCE_SUBMITTED -> {FINALIZED | UNDETERMINED}
@@ -168,13 +183,23 @@ def _coerce_address(val) -> Address:
     mistake in how the address was typed. Accepts an already-correct
     `Address` unchanged, or coerces from `int` / `bytes` / a
     hex-or-base64 string (the latter two already supported directly by
-    `genlayer.py.types.Address`'s real constructor)."""
+    `genlayer.py.types.Address`'s real constructor).
+
+    Closed post-review finding: a negative `int`, or one wider than
+    `Address.SIZE` bytes, previously reached `int.to_bytes` unguarded and
+    raised a raw `OverflowError`/`ValueError` instead of the
+    `gl.vm.UserError` every other input-validation failure in this file
+    uses -- an inconsistent failure mode for what is still just bad
+    caller input, not an internal error."""
     if hasattr(val, "as_bytes"):
         return val
     if isinstance(val, bool):
         raise gl.vm.UserError(f"invalid address value: {val!r}")
     if isinstance(val, int):
-        return Address(val.to_bytes(Address.SIZE, "big"))
+        try:
+            return Address(val.to_bytes(Address.SIZE, "big"))
+        except (OverflowError, ValueError):
+            raise gl.vm.UserError(f"invalid address value: {val!r}")
     if isinstance(val, (bytes, bytearray, memoryview)):
         return Address(bytes(val))
     if isinstance(val, str):
@@ -226,7 +251,23 @@ def _is_valid_verdict(data) -> bool:
     Consensus on a malformed or self-contradictory verdict is not safety;
     this function is the deterministic invariant layer that sits between
     consensus and a state transition (see module docstring's Evidence
-    Integrity section)."""
+    Integrity section).
+
+    Closed post-review finding: this used to check ONLY the direction
+    "decision == APPROVED implies all criteria met" -- the converse never
+    held. A leader (or a confused/adversarial model) emitting
+    decision=REJECTED or decision=UNDETERMINED alongside
+    quantity_match=specification_match=deadline_match=True and
+    critical_exception=False is just as internally contradictory by this
+    system's own decision rules (`_build_prompt`'s "Decision rules"
+    section: those conditions mean APPROVED, nothing else), but used to
+    pass structural validation -- and since both leader and validator run
+    the same (previously incomplete) function, consensus could be reached
+    on that contradictory verdict, permanently closing an obligation as
+    REJECTED/UNDETERMINED even though every criterion the system itself
+    checks says it should be APPROVED. The check below is now symmetric:
+    "all criteria met" and "decision == APPROVED" must always agree, in
+    both directions."""
     if not isinstance(data, dict):
         return False
     if data.get("decision") not in _VALID_DECISIONS:
@@ -242,20 +283,16 @@ def _is_valid_verdict(data) -> bool:
         return False
     if not isinstance(data.get("_fetch_failed"), bool):
         return False
-    # Logical consistency, not just typing: the prompt TELLS the model
-    # "APPROVED only if all three match fields are true and there is no
-    # critical exception" (_build_prompt's decision rules), but a prompt
-    # instruction is not a code-level invariant -- an LLM (or a leader
-    # deliberately returning a crafted payload) could still emit
-    # decision=APPROVED alongside quantity_match=False. Reject that
-    # combination structurally, so it can never reach consensus as a
-    # valid verdict regardless of what any model says.
-    if data["decision"] == DECISION_APPROVED and not (
+
+    all_criteria_met = (
         data["quantity_match"]
         and data["specification_match"]
         and data["deadline_match"]
         and not data["critical_exception"]
-    ):
+    )
+    if all_criteria_met and data["decision"] != DECISION_APPROVED:
+        return False
+    if not all_criteria_met and data["decision"] == DECISION_APPROVED:
         return False
     return True
 
@@ -274,7 +311,13 @@ def _verdicts_semantically_equal(a: dict, b: dict) -> bool:
     content matches what was originally committed to at `submit_evidence`
     time -- see `submit_evidence`'s docstring for exactly why that
     specific gap (raised by external audit) is a documented limitation,
-    not something this hash comparison closes."""
+    not something this hash comparison closes.
+
+    See `_fetch_evidence_text`'s docstring for why the hash input for a
+    FAILED source is a fixed marker, not the raw exception text -- that
+    normalization is what makes this comparison converge to agreement
+    (and therefore UNDETERMINED, not a stuck transaction) when a source is
+    genuinely, consistently unreachable from every node."""
     return (
         a["decision"] == b["decision"]
         and a["quantity_match"] == b["quantity_match"]
@@ -514,33 +557,63 @@ class SemanticObligationGate(gl.Contract):
         evidence_refs: list[str] = [ref for ref in obligation.evidence_refs][:MAX_EVIDENCE_REFS]
 
         def _fetch_evidence_text() -> tuple:
+            """Returns (prompt_text, hash_text, had_failure).
+
+            `prompt_text` is what the LLM actually reads -- it may
+            legitimately contain the raw exception message for a failed
+            fetch, since that's useful, human-readable context for the
+            model.
+
+            `hash_text` is what gets hashed into `_evidence_content_hash`
+            for the leader/validator equality check (see
+            `_verdicts_semantically_equal`). It deliberately does NOT
+            include the raw exception message: exception text (timeout
+            wording, DNS error strings, etc.) is not guaranteed to be
+            identical across independently-selected nodes even when they
+            are all reporting the exact same underlying failure (the
+            source is unreachable). Hashing the raw exception text would
+            make leader and validator disagree on
+            `_evidence_content_hash` precisely in the "source completely
+            down" case -- the one case this fetch-failure handling exists
+            to route safely to UNDETERMINED. Using a fixed, content-free
+            marker per failed source means only the FACT of failure (not
+            its exact wording) participates in the equality check --
+            `_fetch_failed` already carries that fact as an explicit
+            boolean, so nothing is lost by normalizing it here too."""
             if not evidence_refs:
-                return "[NO EVIDENCE SUBMITTED]", True
-            chunks = []
+                return "[NO EVIDENCE SUBMITTED]", "[NO EVIDENCE SUBMITTED]", True
+            prompt_chunks = []
+            hash_chunks = []
             had_failure = False
             for ref in evidence_refs:
                 try:
                     response = gl.nondet.web.request(ref, method="GET")
                     body = response.body.decode("utf-8", errors="replace")
+                    hash_body = body[:MAX_EVIDENCE_CHARS_PER_SOURCE]
                 except Exception as exc:  # network/parse failure is DATA, not a crash
                     body = f"[EVIDENCE_FETCH_FAILED: {exc}]"
+                    # Deterministic-across-nodes marker -- see docstring above.
+                    hash_body = "[EVIDENCE_FETCH_FAILED]"
                     had_failure = True
-                chunks.append(
+                prompt_chunks.append(
                     f"--- SOURCE: {ref} ---\n{body[:MAX_EVIDENCE_CHARS_PER_SOURCE]}"
                 )
-            return "\n\n".join(chunks), had_failure
+                hash_chunks.append(f"--- SOURCE: {ref} ---\n{hash_body}")
+            return "\n\n".join(prompt_chunks), "\n\n".join(hash_chunks), had_failure
 
         def _run_adjudication() -> dict:
-            evidence_text, fetch_failed = _fetch_evidence_text()
+            evidence_text, evidence_hash_text, fetch_failed = _fetch_evidence_text()
             prompt = _build_prompt(policy_text, deadline_iso, evidence_text)
             raw = gl.nondet.exec_prompt(prompt, response_format="json")
             if not isinstance(raw, dict):
                 raise gl.vm.UserError("LLM did not return a JSON object")
-            # Computed by THIS code from what was actually fetched, never by
-            # the LLM -- see _verdicts_semantically_equal's docstring for
-            # exactly what this does and does not prove.
+            # Computed by THIS code from a normalized view of what was
+            # actually fetched, never by the LLM -- see
+            # `_fetch_evidence_text`'s docstring for exactly what this does
+            # and does not prove, and why failed sources hash a fixed
+            # marker instead of the raw exception text.
             raw["_evidence_content_hash"] = hashlib.sha256(
-                evidence_text.encode("utf-8")
+                evidence_hash_text.encode("utf-8")
             ).hexdigest()
             raw["_fetch_failed"] = fetch_failed
             # DETERMINISTIC INVARIANT, not a prompt suggestion: a retrieval
