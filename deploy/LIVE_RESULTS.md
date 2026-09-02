@@ -98,8 +98,62 @@ non-linear dependency graph, CertificationGate correctly read the final
 ## Cross-reference
 
 - Full technical writeup of every bug found (Studio-serialization `int`
-  vs `Address`, mutable-evidence-URL consensus gap) and fixed: see
-  `docs/architecture.md`, particularly §23.8 and Part D (§28).
+  vs `Address`, mutable-evidence-URL consensus gap, and the independent
+  external audit) and fixed: see `SECURITY.md`.
 - Deterministic, automated coverage of the same behaviors demonstrated
-  live above: `tests/` (45/45 passing, `pytest tests/ -v`).
+  live above: `tests/` (56/56 passing, `pytest tests/ -v`).
 - Manual step-by-step reproduction instructions: `deploy/STUDIO_TESTING_GUIDE.md`.
+
+## Scenario 3 — `permit-3`: redeployed Gate + Router, honest REJECTED path
+(deadline typo, not a contract bug)
+
+Redeployed both `semantic_obligation_gate.py` and `process_graph_router.py`
+with the fixes from the external audit (see `SECURITY.md` §E). This run
+exercised the fixed contracts against a fresh single-stage process and
+incidentally produced a clean, real example of the system correctly
+rejecting an obligation on genuinely unmet criteria — worth keeping in the
+record rather than only showing successes.
+
+| Step | Method | Tx hash | Result |
+|---|---|---|---|
+| `register_authority("fire_safety", owner)` | write | `0xaa2ae58c1b8f902bbff27b66afb58a58c14d73f0dd2ccc6fe2845a5bb25b71ca` | SUCCESS |
+| `create_obligation("permit-3:fire_safety", ...)` | write | `0x90a42c3df8be489240c6d98109bae045ebdc58d9be85ec4254ebd5a72333ff7e` | SUCCESS — **note:** `deadline_iso` was entered as `2026-01-02T00:00:00+00:00`, not the intended `2026-12-31` (input error, not a contract bug) |
+| `register_process("permit-3", ...)` | write | `0x1c7f5db7d7acc105a6a33ce41ef113d2fe5cd2ab11cafb936dfd6272d278c2c8` | SUCCESS |
+| `submit_evidence` (same gist as prior scenarios) | write | `0x1caca9a54b47cb2da4dde144316075e6336b25a109977f81fa7caef06c050ebc` | SUCCESS |
+| `adjudicate` | write | `0xa097560b04a0bdb9201b1a991d0301b9738b2d3c89b6cc4897ef0ab9ecfc5486` | SUCCESS → verdict **`REJECTED`**, `deadline_match=false`, `reason_code="DEADLINE_MISSED"` — correct: actual delivery date (2026-06-01) is after the (mistakenly-early) stated deadline. Equivalence Principle output also shows `_evidence_content_hash` and `_fetch_failed=false` as first-class compared fields, confirming the external-audit fixes are live in this deployment, not just in tests |
+| `refresh_process_status("permit-3")` | write | `0xca9040079be522dbf66e2a091096a42d1cfbf8dde32ec63b8045246bd8161f43` | SUCCESS → status `FAILED` (correct: mandatory stage `FINALIZED`+`REJECTED`) |
+| `claim_eligibility("permit-3")` | write | `0xcda14355ad2c194d63a193890ab746803cf177cf457236f401b140f72c8d7565` | ERROR (expected) — `[rollback] process 'permit-3' is not COMPLETE ... status=FAILED` |
+
+**Outcome: a real REJECTED → FAILED → correctly-refused-eligibility chain**,
+caused by an honest input mistake rather than a contract defect — useful
+evidence that the system doesn't quietly "fix" bad input, it reports it
+faithfully. `permit-3:fire_safety` and `permit-3` are now permanently
+terminal (`FINALIZED`/`REJECTED` and `FAILED` respectively) and were not
+reused.
+
+## Scenario 4 — `permit-4`: corrected deadline, full happy path, PLUS live
+confirmation of the anti-replay fix (external audit findings #4/#5)
+
+Same Gate/Router deployment as Scenario 3, new `obligation_id`/`process_id`
+(required, since `permit-3:fire_safety` is permanently terminal).
+
+`create_obligation` → `register_process` → `submit_evidence` → `adjudicate`
+→ `APPROVED` → `refresh_process_status` → `COMPLETE` → `claim_eligibility`
+→ `ELIGIBLE` all completed successfully (individual tx hashes for this
+portion were not re-quoted in the transcript, consistent with earlier
+scenarios' happy-path steps).
+
+**The key new live evidence — `register_process("permit-4-fake", ...)`
+reusing `permit-4:fire_safety`:**
+
+| Step | Method | Tx hash | Result |
+|---|---|---|---|
+| `register_process("permit-4-fake", ...)` reusing `permit-4:fire_safety` in an unrelated, fabricated process | write | `0x593e8f420f1314d8aee1b467b134322b907faacaf1c3488c9456fe9fe50c81de` | **ERROR (expected)** — `[rollback] obligation 'permit-4:fire_safety' is already bound to another stage or process -- an obligation may only ever be used for one stage, once` |
+
+**This is the live, on-chain confirmation of `SECURITY.md`'s findings
+#4/#5 fix** — the exact attack the external audit described (replaying an
+already-used obligation into a fabricated process) was attempted against
+a real deployment and correctly refused by consensus. Previously this fix
+was verified only for its intra-graph half in Direct Mode (no live Gate
+available in that test mode); this run closes the remaining live-only gap
+noted in `SECURITY.md`.
