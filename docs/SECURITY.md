@@ -703,3 +703,140 @@ model itself, not in a check written after the fact.
 | `test_process_graph_router.py` | 27 (+6 this pass) | 27 passed |
 | `test_certification_gate.py` | 6 | 6 passed |
 | **Total** | **56** | **56 passed** |
+
+## 10. Post-independent-review findings (second independent review)
+
+A second independent review found four additional issues beyond the
+external audit in §9, all now closed. Recorded here in the same format,
+for the same reason: so they don't need to be rediscovered.
+
+### #11 [CLOSED, 🔴 critical] Evidence-fetch-failure hash broke the exact
+availability guarantee it was meant to provide
+
+**The finding.** `_evidence_content_hash` was computed from the same
+`evidence_text` shown to the LLM, including, for a failed fetch, the raw
+exception message (`f"[EVIDENCE_FETCH_FAILED: {exc}]"`). Exception text is
+not guaranteed to be identical across independently-selected nodes even
+when every node is reporting the exact same underlying failure (a source
+that is genuinely, consistently unreachable). Since `_verdicts_semantically_equal`
+requires this hash to match, leader and validator could disagree on it in
+precisely the "source completely down" case -- the one case finding #2
+(§9) was built to route safely to `UNDETERMINED`. The practical effect:
+instead of reaching `UNDETERMINED`, `run_nondet_unsafe` could fail to
+reach agreement at all, and the transaction simply would not commit --
+directly contradicting `docs/architecture.md` §4's claim that fetch
+failures are "converted into evidence content... rather than crashing the
+transaction... This avoids a single flaky HTTP source turning into a
+denial-of-service." Direct Mode cannot catch this by construction (same
+blind spot documented in §8's opening paragraph: mocked leader/validator
+fetches are always byte-identical).
+
+**Fix.** `_fetch_evidence_text` now returns a separate, normalized
+`hash_text` alongside the human-readable `prompt_text`: for any source
+that failed to fetch, the hash input is a fixed marker
+(`"[EVIDENCE_FETCH_FAILED]"`), never the raw exception text. Only the
+`_fetch_failed` boolean (already a required, compared field) carries the
+fact of failure into the equality check now -- the exact wording never
+does.
+
+**Verified.** `test_fetch_failure_hash_ignores_exception_wording`
+(Direct Mode) confirms the override still fires and the same result is
+reproduced on independent re-derivation.
+
+### #12 [CLOSED, 🟠 high] `_is_valid_verdict` only checked APPROVED's
+direction, not its converse
+
+**The finding.** The consistency check added for finding #3 (§9) only
+enforced "decision == APPROVED implies all criteria met". The converse
+never held: `{"decision": "REJECTED", "quantity_match": true,
+"specification_match": true, "deadline_match": true, "critical_exception":
+false, ...}` is just as contradictory by this system's own decision rules
+(`_build_prompt`'s "Decision rules" section says those conditions mean
+APPROVED, nothing else) but passed structural validation. Since both
+leader and validator run the same function, consensus could be reached on
+that contradictory verdict, permanently closing an obligation as
+REJECTED/UNDETERMINED even though every criterion the system itself checks
+says APPROVED.
+
+**Fix.** `_is_valid_verdict` now checks both directions: `all_criteria_met`
+and `decision == APPROVED` must always agree.
+
+**Verified.** `test_contradictory_rejected_verdict_is_invalid`.
+
+### #13 [CLOSED, 🟠 high] Obligation was checked against the right
+authority address, but not the right stage_type
+
+**The finding.** `register_process`'s ownership check only asked "was this
+obligation created by an address that is *an* authority for *some*
+stage_type equal to `expected_authority`?" -- never "was this obligation
+actually designated, by that authority, *for this stage_type*?" The Gate
+has no concept of `stage_type` at all. If one address is registered as
+authority for more than one `stage_type` -- which is not a contrived edge
+case: it's exactly this project's own `deploy/STUDIO_TESTING_GUIDE.md`
+reference scenario, using one `AUTHORITY` address for `fire_safety`,
+`sanitary`, and `final_review` "for simplicity" -- an obligation created
+with a `sanitary` policy would pass the address check for a `fire_safety`
+stage just as well, on its first use. `claimed_obligation_ids` (§9,
+finding #4/#5) only ever prevented *reuse*; it did nothing for a mismatch
+on first use.
+
+**Fix.** New `bind_obligation_stage_type(obligation_id, stage_type)` on
+`ProcessGraphRouter`, callable only by the registered authority for
+`stage_type`, who must also be the obligation's `buyer` on the Gate. It
+records a permanent, one-time `obligation_id -> stage_type` binding.
+`register_process` now requires this binding to exist and match before
+accepting a stage, in addition to (not instead of) the pre-existing
+address check.
+
+**Verified.** `test_bind_obligation_stage_type_requires_registered_stage_type`,
+`test_bind_obligation_stage_type_requires_correct_authority`,
+`test_register_process_rejects_unbound_obligation` -- all fully testable
+in Direct Mode since the new check runs before any cross-contract read.
+`deploy/STUDIO_TESTING_GUIDE.md`'s reference scenario has been updated
+with the required binding step (step 2a).
+
+### #14 [CLOSED, 🟠 high] A REJECTED non-mandatory dependency could
+deadlock a process forever
+
+**The finding.** `refresh_process_status` only checked **mandatory**
+stages for a `REJECTED` verdict when deciding whether to fail the whole
+process. `get_unblocked_stages` requires ANY dependency -- mandatory or
+not -- to be `FINALIZED`+`APPROVED` before something depending on it can
+unblock. `REJECTED` is terminal on the Gate (no re-adjudication once
+`FINALIZED`). Combined: a non-mandatory stage that some other (possibly
+mandatory) stage depends on could be `REJECTED`, permanently blocking that
+dependent stage from ever unblocking, while the process itself stayed
+`ACTIVE` forever -- since the `REJECTED` stage was never itself mandatory.
+Unlike the already-documented "no timeout for `UNDETERMINED`" limitation
+(§4, known limitation #4), which always has a path forward (re-submit
+evidence, re-adjudicate), this had none: `REJECTED` is terminal.
+
+**Fix.** `refresh_process_status` now also treats a `REJECTED` stage as
+fatal to the whole process whenever it appears as a `depends_on` target of
+any edge in the graph, regardless of its own `mandatory` flag. A
+non-mandatory stage nothing else depends on can still be `REJECTED`
+without failing the process, exactly as before.
+
+**Verified by re-derivation, not by execution** (same, already-documented
+Direct Mode limitation as `refresh_process_status` itself, §4 known
+limitation #4 / `docs/architecture.md` §23.4: this method needs a real
+deployed Gate to exercise at all, cross-contract calls cannot be tested in
+Direct Mode). No existing test in this repository ever passed
+`mandatory: false` for any stage (confirmed by inspection), so this was
+not previously covered, positively or negatively, by any test run.
+
+### Tally after this review's fixes
+
+| File | Tests | Result |
+|---|---|---|
+| `test_semantic_gate.py` | 23 (+2 this pass) | 25 total, all pass |
+| `test_process_graph_router.py` | 27 (+3 this pass) | 30 total, all pass |
+| `test_certification_gate.py` | 6 | 6 pass |
+| **Total** | | **61 pass** |
+
+`refresh_process_status`'s fix (finding #14) is verified by code
+re-derivation only, consistent with this project's own precedent for
+that method (§9, finding #9) -- a live/glsim run exercising a
+non-mandatory-REJECTED-with-a-dependent scenario is the remaining open
+item to fully close this the way §9's findings #4/#5 were eventually
+closed live (`deploy/LIVE_RESULTS.md` scenario 4).
