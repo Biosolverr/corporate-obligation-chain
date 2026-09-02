@@ -393,3 +393,67 @@ def test_edge_referencing_unknown_stage_rejected(direct_vm, direct_deploy):
     )
     with direct_vm.expect_revert("unknown depends_on"):
         router.register_process("p1", graph)
+
+
+# --------------------------------------------------------------------- #
+# Post-review regression tests: obligation <-> stage_type binding
+# (all of this runs BEFORE any cross-contract read, so it is fully
+# testable in Direct Mode even without a real Gate deployed -- same
+# reasoning as the DAG structural/cycle validation tests above)
+# --------------------------------------------------------------------- #
+
+
+def test_bind_obligation_stage_type_requires_registered_stage_type(direct_vm, direct_deploy):
+    gate_addr = _addr("gate")
+    admin = _addr("admin")
+    router = _deploy_router(direct_deploy, direct_vm, admin, gate_addr)
+
+    with direct_vm.expect_revert("no authority registered"):
+        router.bind_obligation_stage_type("p1:a", "fire_safety")
+
+
+def test_bind_obligation_stage_type_requires_correct_authority(direct_vm, direct_deploy):
+    gate_addr = _addr("gate")
+    admin = _addr("admin")
+    fire_dept = _addr("fire_dept")
+    intruder = _addr("intruder")
+    router = _deploy_router(direct_deploy, direct_vm, admin, gate_addr)
+    with direct_vm.prank(admin):
+        router.register_authority("fire_safety", fire_dept)
+
+    with direct_vm.prank(intruder):
+        with direct_vm.expect_revert("only the registered authority"):
+            router.bind_obligation_stage_type("p1:a", "fire_safety")
+
+
+def test_register_process_rejects_unbound_obligation(direct_vm, direct_deploy):
+    """Closed post-review finding: an obligation created by an address
+    that IS the registered authority for a stage_type must still be
+    explicitly bound to that stage_type before register_process will
+    trust it -- otherwise an authority governing more than one stage_type
+    could have an obligation meant for one stage_type silently accepted
+    for another. This check is local (no cross-contract read needed) and
+    runs before `_read_gate_obligation` is ever reached, so it is fully
+    verifiable in Direct Mode even without a live Gate."""
+    gate_addr = _addr("gate")
+    admin = _addr("admin")
+    authority = _addr("authority")
+    router = _deploy_router(direct_deploy, direct_vm, admin, gate_addr)
+    with direct_vm.prank(admin):
+        router.register_authority("fire_safety", authority)
+
+    graph = json.dumps(
+        {
+            "stages": [
+                {
+                    "stage_id": "a",
+                    "stage_type": "fire_safety",
+                    "obligation_id": "p1:a",
+                    "mandatory": True,
+                }
+            ],
+            "edges": [],
+        }
+    )
+    with direct_vm.expect_revert("has not been bound"):
+        router.register_process("p1", graph)
