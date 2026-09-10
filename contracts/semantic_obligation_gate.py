@@ -556,78 +556,66 @@ class SemanticObligationGate(gl.Contract):
         deadline_iso: str = obligation.deadline_iso
         evidence_refs: list[str] = [ref for ref in obligation.evidence_refs][:MAX_EVIDENCE_REFS]
 
-        def _fetch_evidence_text() -> tuple:
-            """Returns (prompt_text, hash_text, had_failure).
+        # NOTE ON STRUCTURE (post-GenVM-lint-rejection refactor): the
+        # evidence fetch (`gl.nondet.web.request`) and the LLM call
+        # (`gl.nondet.exec_prompt`) used to live in helper functions that
+        # `leader_fn`/`validator_fn` merely called. That was semantically
+        # fine -- the calls still only ever executed inside
+        # `run_nondet_unsafe` -- but GenVM's static equivalence-principle
+        # checker does not walk the call graph; it looks for `gl.nondet.*`
+        # calls written directly inside the function bodies passed to
+        # `run_nondet_unsafe`. A call reached through an intermediate `def`
+        # is invisible to it. Fix: the fetch-and-adjudicate logic is
+        # written out directly, in full, inside BOTH `leader_fn` and
+        # `validator_fn` below -- duplicated on purpose, so each one is
+        # self-contained and every `gl.nondet.*` call is textually inside
+        # the function the checker inspects, with nothing to trace.
+        # `_build_prompt`, `_is_valid_verdict`, `_verdicts_semantically_equal`
+        # stay as separate module-level functions: none of them contains a
+        # `gl.nondet.*` call, so they aren't part of what the lint checks.
 
-            `prompt_text` is what the LLM actually reads -- it may
-            legitimately contain the raw exception message for a failed
-            fetch, since that's useful, human-readable context for the
-            model.
-
-            `hash_text` is what gets hashed into `_evidence_content_hash`
-            for the leader/validator equality check (see
-            `_verdicts_semantically_equal`). It deliberately does NOT
-            include the raw exception message: exception text (timeout
-            wording, DNS error strings, etc.) is not guaranteed to be
-            identical across independently-selected nodes even when they
-            are all reporting the exact same underlying failure (the
-            source is unreachable). Hashing the raw exception text would
-            make leader and validator disagree on
-            `_evidence_content_hash` precisely in the "source completely
-            down" case -- the one case this fetch-failure handling exists
-            to route safely to UNDETERMINED. Using a fixed, content-free
-            marker per failed source means only the FACT of failure (not
-            its exact wording) participates in the equality check --
-            `_fetch_failed` already carries that fact as an explicit
-            boolean, so nothing is lost by normalizing it here too."""
+        def leader_fn() -> dict:
             if not evidence_refs:
-                return "[NO EVIDENCE SUBMITTED]", "[NO EVIDENCE SUBMITTED]", True
-            prompt_chunks = []
-            hash_chunks = []
-            had_failure = False
-            for ref in evidence_refs:
-                try:
-                    response = gl.nondet.web.request(ref, method="GET")
-                    body = response.body.decode("utf-8", errors="replace")
-                    hash_body = body[:MAX_EVIDENCE_CHARS_PER_SOURCE]
-                except Exception as exc:  # network/parse failure is DATA, not a crash
-                    body = f"[EVIDENCE_FETCH_FAILED: {exc}]"
-                    # Deterministic-across-nodes marker -- see docstring above.
-                    hash_body = "[EVIDENCE_FETCH_FAILED]"
-                    had_failure = True
-                prompt_chunks.append(
-                    f"--- SOURCE: {ref} ---\n{body[:MAX_EVIDENCE_CHARS_PER_SOURCE]}"
-                )
-                hash_chunks.append(f"--- SOURCE: {ref} ---\n{hash_body}")
-            return "\n\n".join(prompt_chunks), "\n\n".join(hash_chunks), had_failure
+                evidence_text = "[NO EVIDENCE SUBMITTED]"
+                evidence_hash_text = "[NO EVIDENCE SUBMITTED]"
+                fetch_failed = True
+            else:
+                prompt_chunks = []
+                hash_chunks = []
+                fetch_failed = False
+                for ref in evidence_refs:
+                    try:
+                        response = gl.nondet.web.request(ref, method="GET")
+                        body = response.body.decode("utf-8", errors="replace")
+                        hash_body = body[:MAX_EVIDENCE_CHARS_PER_SOURCE]
+                    except Exception as exc:  # network/parse failure is DATA, not a crash
+                        body = f"[EVIDENCE_FETCH_FAILED: {exc}]"
+                        # Fixed, content-free marker so leader/validator
+                        # converge on `_evidence_content_hash` even when
+                        # the raw exception text differs node-to-node --
+                        # see `_verdicts_semantically_equal`'s docstring.
+                        hash_body = "[EVIDENCE_FETCH_FAILED]"
+                        fetch_failed = True
+                    prompt_chunks.append(
+                        f"--- SOURCE: {ref} ---\n{body[:MAX_EVIDENCE_CHARS_PER_SOURCE]}"
+                    )
+                    hash_chunks.append(f"--- SOURCE: {ref} ---\n{hash_body}")
+                evidence_text = "\n\n".join(prompt_chunks)
+                evidence_hash_text = "\n\n".join(hash_chunks)
 
-        def _run_adjudication() -> dict:
-            evidence_text, evidence_hash_text, fetch_failed = _fetch_evidence_text()
             prompt = _build_prompt(policy_text, deadline_iso, evidence_text)
             raw = gl.nondet.exec_prompt(prompt, response_format="json")
             if not isinstance(raw, dict):
                 raise gl.vm.UserError("LLM did not return a JSON object")
-            # Computed by THIS code from a normalized view of what was
-            # actually fetched, never by the LLM -- see
-            # `_fetch_evidence_text`'s docstring for exactly what this does
-            # and does not prove, and why failed sources hash a fixed
-            # marker instead of the raw exception text.
+
             raw["_evidence_content_hash"] = hashlib.sha256(
                 evidence_hash_text.encode("utf-8")
             ).hexdigest()
             raw["_fetch_failed"] = fetch_failed
-            # DETERMINISTIC INVARIANT, not a prompt suggestion: a retrieval
-            # failure (or genuinely missing evidence) can NEVER be allowed
-            # to reach APPROVED, no matter what the model says. The prompt
-            # already asks the model to choose UNDETERMINED here, but a
-            # prompt instruction is not an enforced invariant -- this is.
             if fetch_failed and raw.get("decision") == DECISION_APPROVED:
                 raw["decision"] = DECISION_UNDETERMINED
                 raw["reason_code"] = "EVIDENCE_FETCH_FAILED"
             return raw
-
-        def leader_fn():
-            return _run_adjudication()
 
         def validator_fn(leaders_res) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
@@ -637,7 +625,48 @@ class SemanticObligationGate(gl.Contract):
             leader_data = leaders_res.calldata
             if not _is_valid_verdict(leader_data):
                 return False
-            own_data = _run_adjudication()
+
+            # Independent re-run of the exact same fetch-and-adjudicate
+            # logic as `leader_fn` above (duplicated, not called, for the
+            # same lint-visibility reason -- see the note above `leader_fn`).
+            if not evidence_refs:
+                evidence_text = "[NO EVIDENCE SUBMITTED]"
+                evidence_hash_text = "[NO EVIDENCE SUBMITTED]"
+                fetch_failed = True
+            else:
+                prompt_chunks = []
+                hash_chunks = []
+                fetch_failed = False
+                for ref in evidence_refs:
+                    try:
+                        response = gl.nondet.web.request(ref, method="GET")
+                        body = response.body.decode("utf-8", errors="replace")
+                        hash_body = body[:MAX_EVIDENCE_CHARS_PER_SOURCE]
+                    except Exception as exc:
+                        body = f"[EVIDENCE_FETCH_FAILED: {exc}]"
+                        hash_body = "[EVIDENCE_FETCH_FAILED]"
+                        fetch_failed = True
+                    prompt_chunks.append(
+                        f"--- SOURCE: {ref} ---\n{body[:MAX_EVIDENCE_CHARS_PER_SOURCE]}"
+                    )
+                    hash_chunks.append(f"--- SOURCE: {ref} ---\n{hash_body}")
+                evidence_text = "\n\n".join(prompt_chunks)
+                evidence_hash_text = "\n\n".join(hash_chunks)
+
+            prompt = _build_prompt(policy_text, deadline_iso, evidence_text)
+            raw = gl.nondet.exec_prompt(prompt, response_format="json")
+            if not isinstance(raw, dict):
+                return False
+
+            raw["_evidence_content_hash"] = hashlib.sha256(
+                evidence_hash_text.encode("utf-8")
+            ).hexdigest()
+            raw["_fetch_failed"] = fetch_failed
+            if fetch_failed and raw.get("decision") == DECISION_APPROVED:
+                raw["decision"] = DECISION_UNDETERMINED
+                raw["reason_code"] = "EVIDENCE_FETCH_FAILED"
+
+            own_data = raw
             if not _is_valid_verdict(own_data):
                 return False
             return _verdicts_semantically_equal(own_data, leader_data)
