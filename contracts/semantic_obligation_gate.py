@@ -82,10 +82,11 @@ reporting the exact same underlying failure ("this source is unreachable").
 Hashing that raw, non-deterministic text would make leader and validator
 disagree on `_evidence_content_hash` precisely in the "source completely
 down" case — which is exactly the case this contract is supposed to route
-safely to UNDETERMINED, not fail to reach consensus on at all. See
-`_fetch_evidence_text`'s docstring for the fix: only the FACT of a fetch
-failure (already carried by the `_fetch_failed` boolean) participates in the
-hash for a failed source, never the exact wording of the failure.
+safely to UNDETERMINED, not fail to reach consensus on at all. Only the FACT
+of a fetch failure (already carried by the `_fetch_failed` boolean, and now
+also by hardcoded values for the four match/exception fields — see
+`leader_fn`'s comment) participates in the hash for a failed source, never
+the exact wording of the failure.
 
 STATE MACHINE
 -----------------
@@ -311,13 +312,7 @@ def _verdicts_semantically_equal(a: dict, b: dict) -> bool:
     content matches what was originally committed to at `submit_evidence`
     time -- see `submit_evidence`'s docstring for exactly why that
     specific gap (raised by external audit) is a documented limitation,
-    not something this hash comparison closes.
-
-    See `_fetch_evidence_text`'s docstring for why the hash input for a
-    FAILED source is a fixed marker, not the raw exception text -- that
-    normalization is what makes this comparison converge to agreement
-    (and therefore UNDETERMINED, not a stuck transaction) when a source is
-    genuinely, consistently unreachable from every node."""
+    not something this hash comparison closes."""
     return (
         a["decision"] == b["decision"]
         and a["quantity_match"] == b["quantity_match"]
@@ -473,21 +468,11 @@ class SemanticObligationGate(gl.Contract):
         """`evidence_hash` is a submitter-declared value, stored as-is and
         NEVER cryptographically verified against fetched content by this
         contract. This is a deliberate, documented limitation, not an
-        oversight (an earlier draft of this file tried to auto-compare it
-        against the internally-fetched-and-formatted content hash and
-        force `UNDETERMINED` on any mismatch -- that was reverted because
-        no realistic submitter can predict this contract's internal
-        prompt-truncation/formatting exactly, which would have made
-        EVERY normal submission mismatch and degrade to `UNDETERMINED`).
-        Use `get_obligation()`'s `resolved_evidence_hash` field after
-        adjudication for an audit trail of what was actually fetched and
-        agreed upon by consensus -- comparing that, off-chain, against
+        oversight. Use `get_obligation()`'s `resolved_evidence_hash` field
+        after adjudication for an audit trail of what was actually fetched
+        and agreed upon by consensus -- comparing that, off-chain, against
         whatever your own process expected is a reasonable manual check,
-        but this contract does not automate it. If you need a real,
-        on-chain-enforceable commitment to evidence content, point
-        `evidence_refs` at content-addressed storage (e.g. an IPFS URI
-        whose CID already is the content hash) instead of a plain mutable
-        URL -- see the module docstring's Evidence Integrity section."""
+        but this contract does not automate it."""
         obligation = self._get_obligation_or_revert(obligation_id)
 
         sender = gl.message.sender_address
@@ -592,8 +577,7 @@ class SemanticObligationGate(gl.Contract):
                         body = f"[EVIDENCE_FETCH_FAILED: {exc}]"
                         # Fixed, content-free marker so leader/validator
                         # converge on `_evidence_content_hash` even when
-                        # the raw exception text differs node-to-node --
-                        # see `_verdicts_semantically_equal`'s docstring.
+                        # the raw exception text differs node-to-node.
                         hash_body = "[EVIDENCE_FETCH_FAILED]"
                         fetch_failed = True
                     prompt_chunks.append(
@@ -612,8 +596,27 @@ class SemanticObligationGate(gl.Contract):
                 evidence_hash_text.encode("utf-8")
             ).hexdigest()
             raw["_fetch_failed"] = fetch_failed
-            if fetch_failed and raw.get("decision") == DECISION_APPROVED:
+            if fetch_failed:
+                # DETERMINISTIC OVERRIDE, closing a post-Studio-testing
+                # finding: previously only `decision` was forced here,
+                # leaving quantity_match/specification_match/deadline_match/
+                # critical_exception to whatever each model individually
+                # guessed from the (non-deterministic-wording) fetch
+                # exception text baked into the prompt. Independently
+                # selected nodes could then legitimately disagree on those
+                # four booleans even while agreeing on `decision`, causing
+                # spurious validator Disagree / leader rotation on a
+                # fetch-failure that every node in fact agrees is a
+                # fetch-failure. None of these four fields can be honestly
+                # asserted true when the evidence was never read, so they
+                # are hardcoded here -- same fixed values leader and
+                # validator both compute, same as `_evidence_content_hash`
+                # already was.
                 raw["decision"] = DECISION_UNDETERMINED
+                raw["quantity_match"] = False
+                raw["specification_match"] = False
+                raw["deadline_match"] = False
+                raw["critical_exception"] = True
                 raw["reason_code"] = "EVIDENCE_FETCH_FAILED"
             return raw
 
@@ -662,8 +665,15 @@ class SemanticObligationGate(gl.Contract):
                 evidence_hash_text.encode("utf-8")
             ).hexdigest()
             raw["_fetch_failed"] = fetch_failed
-            if fetch_failed and raw.get("decision") == DECISION_APPROVED:
+            if fetch_failed:
+                # Same deterministic override as `leader_fn` -- see the
+                # comment there. Duplicated, not called, for the same
+                # lint-visibility reason as the rest of this function.
                 raw["decision"] = DECISION_UNDETERMINED
+                raw["quantity_match"] = False
+                raw["specification_match"] = False
+                raw["deadline_match"] = False
+                raw["critical_exception"] = True
                 raw["reason_code"] = "EVIDENCE_FETCH_FAILED"
 
             own_data = raw
