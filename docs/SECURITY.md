@@ -257,9 +257,9 @@ comparison); it does not address content that differs but happens to
 support the same conclusion (e.g., two slightly different but both-valid
 certificate scans).
 
-**Fix.** `_run_adjudication` now computes
+**Fix.** `leader_fn`/`validator_fn` now compute
 `hashlib.sha256(evidence_text.encode("utf-8")).hexdigest()` from the
-exact evidence text it fetched, attaches it to the verdict dict as
+exact evidence text they fetched, attach it to the verdict dict as
 `_evidence_content_hash` (computed by contract code, never supplied or
 influenced by the LLM), and `_verdicts_semantically_equal` now compares
 this hash as a seventh required field alongside the six decision fields.
@@ -521,12 +521,17 @@ Nothing in code stopped a misbehaving or hallucinating model from
 answering `APPROVED` anyway — `_is_valid_verdict` checked structure, not
 "did retrieval actually succeed".
 
-**Fix:** `_fetch_evidence_text` now returns `(text, had_failure: bool)`.
-`_run_adjudication` computes this per call and, if `had_failure` is
-`True` and the model said `APPROVED` anyway, **deterministically
-overrides** the decision to `UNDETERMINED` with `reason_code =
-"EVIDENCE_FETCH_FAILED"` — in code, unconditionally, not as a prompt
-suggestion. `_fetch_failed` is also now a required field in
+**Fix:** `leader_fn`/`validator_fn` fetch evidence and track a
+`fetch_failed: bool` locally. If `fetch_failed` is `True`, **all five**
+verdict fields (`decision`, `quantity_match`, `specification_match`,
+`deadline_match`, `critical_exception`) are **deterministically
+overridden** — `decision` to `UNDETERMINED`, `reason_code` to
+`"EVIDENCE_FETCH_FAILED"`, the four booleans hardcoded — in code,
+unconditionally, not as a prompt suggestion, and not left to the model's
+own interpretation regardless of what it said. (Originally this override
+only forced `decision`, and only when the model had said `APPROVED`; see
+finding #15 in §11 for why that was tightened further, after this fix was
+already live.) `_fetch_failed` is also now a required field in
 `_is_valid_verdict` and a compared field in `_verdicts_semantically_equal`,
 so leader and validator must agree on whether retrieval succeeded, not
 just on the resulting decision.
@@ -731,9 +736,9 @@ denial-of-service." Direct Mode cannot catch this by construction (same
 blind spot documented in §8's opening paragraph: mocked leader/validator
 fetches are always byte-identical).
 
-**Fix.** `_fetch_evidence_text` now returns a separate, normalized
-`hash_text` alongside the human-readable `prompt_text`: for any source
-that failed to fetch, the hash input is a fixed marker
+**Fix.** `leader_fn`/`validator_fn` build a separate, normalized
+`evidence_hash_text` alongside the human-readable `evidence_text`: for any
+source that failed to fetch, the hash input is a fixed marker
 (`"[EVIDENCE_FETCH_FAILED]"`), never the raw exception text. Only the
 `_fetch_failed` boolean (already a required, compared field) carries the
 fact of failure into the equality check now -- the exact wording never
@@ -840,3 +845,112 @@ that method (§9, finding #9) -- a live/glsim run exercising a
 non-mandatory-REJECTED-with-a-dependent scenario is the remaining open
 item to fully close this the way §9's findings #4/#5 were eventually
 closed live (`deploy/LIVE_RESULTS.md` scenario 4).
+
+## 11. GenVM linter rejection and post-fix Studio findings
+
+This submission was rejected once by GenLayer review on `genvm-lint`
+grounds (not by any of the findings in §9/§10, all of which were already
+closed). Recorded here in the same format for the same reason.
+
+### #15 [CLOSED, 🟠 high — blocked submission] `gl.nondet.*` calls were
+nested behind helper functions the linter could not see into
+
+**The finding.** `genvm-lint check contracts/semantic_obligation_gate.py`
+failed with two `E010` errors: `gl.nondet.web.request` (inside the former
+`_fetch_evidence_text`) and `gl.nondet.exec_prompt` (inside the former
+`_run_adjudication`) were reported as "not reachable from equivalence
+principle block". Both calls only ever executed inside
+`gl.vm.run_nondet_unsafe(leader_fn, validator_fn)` at runtime — `leader_fn`
+called `_run_adjudication`, which called `_fetch_evidence_text` — but
+`genvm-lint`'s static check does not walk the call graph; it only inspects
+the function bodies passed directly to `run_nondet_unsafe`. A `gl.nondet.*`
+call reached through an intermediate `def` is invisible to it, correct
+runtime behavior notwithstanding.
+
+**Fix.** The fetch-and-adjudicate logic (evidence fetch loop, prompt
+build, `gl.nondet.exec_prompt` call, hash computation, fetch-failure
+override) is now written out directly, in full, inside both `leader_fn`
+and `validator_fn` — duplicated on purpose, not factored into a shared
+helper, so every `gl.nondet.*` call is textually inside the function the
+linter inspects. `_build_prompt`, `_is_valid_verdict`,
+`_verdicts_semantically_equal` remain separate module-level functions:
+none of them contains a `gl.nondet.*` call, so `genvm-lint` never needed to
+see into them.
+
+**Verified.** `genvm-lint check contracts/semantic_obligation_gate.py
+--json` now returns `{"ok":true,"lint":{"ok":true,"passed":3},"validate":
+{"ok":true,"contract":"SemanticObligationGate","methods":7,...}}` — zero
+warnings. `adjudicate()`'s behavior is otherwise unchanged (same fields,
+same checks), so the existing `test_semantic_gate.py` suite continues to
+pass unmodified; see `deploy/RESUBMISSION_RESULTS.md` for live Studio
+confirmation on a fresh deployment (both the `UNDETERMINED`/fetch-failure
+path and the `APPROVED`/real-fetch path).
+
+### #16 [CLOSED, 🟡 medium — found live during resubmission testing] Only
+`decision` was forced deterministic on fetch failure, not the four
+criteria fields
+
+**The finding.** Live Studio testing of the finding #15 fix (above)
+surfaced a real, separate issue in the pre-existing fetch-failure override
+from finding #2 (§9): on `fetch_failed=True`, only `decision` was forced
+to `UNDETERMINED` (and only when the model had said `APPROVED`). The four
+booleans (`quantity_match`, `specification_match`, `deadline_match`,
+`critical_exception`) were left to whatever each independently-selected
+model inferred from the fetch-exception text embedded in its own prompt —
+text that is not guaranteed to read the same way to every model even when
+every node agrees the source is unreachable (the same non-determinism
+class as finding #11/§10, but in the model's *interpretation* of the
+failure rather than in a raw-text hash). Live consequence, observed on a
+real Studio transaction: one validator legitimately disagreed with the
+leader on these fields while both agreed `decision == UNDETERMINED`,
+producing an unnecessary `Disagree` (and, on a separate obligation later
+in the same session, three leader rotations before the transaction managed
+to reach agreement at all).
+
+**Fix.** `leader_fn`/`validator_fn` now hardcode all five fields —
+`decision`, `quantity_match`, `specification_match`, `deadline_match`,
+`critical_exception`, `reason_code` — whenever `fetch_failed` is `True`,
+regardless of what the model returned. None of these four booleans can be
+honestly asserted from evidence that was never actually read, so nothing
+is lost by no longer asking the model to guess them.
+
+**Verified live** (Direct Mode cannot reproduce genuinely differing
+model outputs across leader/validator by construction, same limitation
+noted throughout §8/§10): redeployed to Studio, re-ran the fetch-failure
+scenario — before the fix, 1 of 3 active validators `Disagree`d; after,
+all active validators `Agree`, zero rotations. Full transaction hashes for
+both runs are in `deploy/RESUBMISSION_RESULTS.md`.
+
+### Separate, unresolved-by-design observation from the same live session
+
+On genuinely sparse/ambiguous evidence content (a real fetch succeeds, but
+the content barely relates to the policy — not a `fetch_failed` case at
+all), different LLM validators can legitimately disagree on individual
+semantic fields while still agreeing on the overall `decision`, since
+`_verdicts_semantically_equal` requires exact agreement on all of them.
+This produced a rare VM-level `Undetermined` transaction status (not the
+contract-level `UNDETERMINED` decision — the transaction itself failed to
+commit, storage untouched, safe to retry) on one obligation with a
+one-line evidence document; retrying with a longer, more specific evidence
+body resolved it on the first attempt. Not a contract defect — it's
+inherent to requiring several independently-selected models to agree
+exactly on a multi-field semantic judgment call rather than a single
+number — and not fixed here; noted for anyone authoring policy text for
+this contract, since more specific, less ambiguous policies produce more
+consistent verdicts across models.
+
+### Tally after this session's fixes
+
+| File | Tests | Result |
+|---|---|---|
+| `test_semantic_gate.py` | 25 | 25 pass (unchanged — findings #15/#16 are structural/behavioral tightening, not new branches; see `deploy/RESUBMISSION_RESULTS.md` for live coverage) |
+| `test_process_graph_router.py` | 30 | 30 pass |
+| `test_certification_gate.py` | 6 | 6 pass |
+| **Total** | | **61 pass** |
+
+Findings #15 and #16 are verified live on Studio, not by Direct Mode
+re-derivation alone (Direct Mode cannot exercise `genvm-lint`, and cannot
+by construction reproduce genuinely differing model outputs across
+independently-selected nodes) — see `deploy/RESUBMISSION_RESULTS.md` for
+every transaction hash from both the isolated-Gate and full
+Router+CertificationGate-chain runs.
