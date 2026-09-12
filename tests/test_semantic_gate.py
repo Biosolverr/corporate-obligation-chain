@@ -419,8 +419,9 @@ def test_fetch_failure_hash_ignores_exception_wording(direct_vm, direct_deploy):
     what "consensus agrees" needs) -- Direct Mode mocks the same exception
     identically for both fetch attempts by construction, so it cannot by
     itself reproduce genuinely different exception wording across nodes;
-    see the docstring on `_fetch_evidence_text` for the reasoning that
-    closes the gap regardless."""
+    see the comment above the fixed-marker fallback inside `leader_fn`
+    (contracts/semantic_obligation_gate.py) for the reasoning that closes
+    the gap regardless."""
     contract = _deploy(direct_deploy)
     alice, bob = _addr("alice"), _addr("bob")
     _create_and_submit(contract, direct_vm, alice, bob)
